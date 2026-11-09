@@ -364,7 +364,7 @@ When `->until()` is omitted on an `OnceProp`, `Inertia` inherits `$page->templat
 
 Serialization of `Page`, `Field`, and `User` objects at runtime and static generation of `site/classes/*Page.php` + `inertia.d.ts` are managed by `Totoglu\Inertia\Provider\ProviderRegistry`:
 
-1. **Tier 1 (Built-in Core Providers):** `ScalarFieldDataProvider`, `MediaFieldDataProvider`, `PageReferenceFieldDataProvider`, `RepeaterFieldDataProvider`, `OptionsFieldDataProvider`, `FieldtypeFieldDataProvider` (for `Fieldtype` modules implementing `InertiaFieldtypeInterface`), `TemplateDataProvider`, and `UserDataProvider`.
+1. **Tier 1 (Built-in Core Providers):** `ScalarFieldDataProvider`, `MediaFieldDataProvider` (serializing `Pageimage` with `focus: { top, left, zoom }` and automatically enriching with `srcset`, `sizes`, `sources`, `lqip`, `dominantColor`, `palette`, `colorTheme`, and `imageHash` when [`trk/processwire-intervention-image`](https://github.com/trk/InterventionImage) is installed), `PageReferenceFieldDataProvider`, `RepeaterFieldDataProvider`, `OptionsFieldDataProvider`, `FieldtypeFieldDataProvider` (for `Fieldtype` modules implementing `InertiaFieldtypeInterface`), `TemplateDataProvider`, and `UserDataProvider`.
 2. **Tier 2 (Module Hook):** Third-party modules hook `Inertia::registerProviders` and call `$inertia->registerProvider(...)`.
 3. **Tier 3 (Project Auto-Discovery in `site/inertia/*Provider.php`):** Files in `site/inertia/` under `namespace Totoglu\Inertia\Provider;` are discovered automatically and override lower tiers.
 

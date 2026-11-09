@@ -166,6 +166,8 @@ Used by `site/classes/DefaultPage.php`, `site/classes/*Page.php`, `ProcessInerti
 | `FieldDataProvider::phpType` | `public function phpType(Field $field): string` | PHPDoc `@property` type for `site/classes/*Page.php`. |
 | `FieldDataProvider::tsType` | `public function tsType(Field $field): string` | TypeScript property type for `inertia.d.ts`. |
 | `FieldDataProvider::tsDefinitions` | `public function tsDefinitions(?Field $field = null): array` | Auxiliary TypeScript interfaces (`array<string, string>`) emitted into `inertia.d.ts`. |
+| `MediaFieldDataProvider::formatPageimage` | `public static function formatPageimage(Pageimage $image): array` | Serializes `Pageimage` (`name`, `url`, `httpUrl`, `description`, `ext`, `filesize`, `width`, `height`, `focus: {top, left, zoom}`), automatically appending `srcset`, `sizes`, `sources`, `lqip`, `dominantColor`, `palette`, `colorTheme`, and `imageHash` when `InterventionImage` is installed. |
+| `MediaFieldDataProvider::isInterventionImageInstalled` | `public static function isInterventionImageInstalled(?ProcessWire $wire = null): bool` | Returns `true` when the `InterventionImage` module is installed in ProcessWire. |
 
 ## Extendable Base Classes & Contracts (`Totoglu\Inertia`)
 

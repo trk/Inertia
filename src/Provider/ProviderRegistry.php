@@ -357,13 +357,14 @@ final class ProviderRegistry extends Wire
 	}
 
 	/**
-	 * Resolve the active TypeScript definitions for `InertiaImage` and `InertiaFile` from registered media providers.
+	 * Resolve the active TypeScript definitions for `InertiaImage` (and its sub-interfaces) and `InertiaFile`
+	 * from registered media providers.
 	 *
-	 * @return array{InertiaImage: string, InertiaFile: string}
+	 * @return array<string, string>
 	 */
 	public function mediaTsDefinitions(): array
 	{
-		$defaults = MediaFieldDataProvider::defaultTsDefinitions();
+		$defaults = MediaFieldDataProvider::defaultTsDefinitions($this->wire() !== null ? MediaFieldDataProvider::isInterventionImageInstalled($this->wire()) : null);
 		$targets = [
 			'FieldtypeImage' => 'InertiaImage',
 			'FieldtypeFile' => 'InertiaFile',
@@ -393,6 +394,7 @@ final class ProviderRegistry extends Wire
 	{
 		$definitions = [];
 		$seen = [];
+		$mediaKeys = $this->mediaTsDefinitions();
 
 		foreach ($this->fieldProviders as $provider) {
 			$id = spl_object_id($provider);
@@ -402,7 +404,7 @@ final class ProviderRegistry extends Wire
 			$seen[$id] = true;
 
 			foreach ($provider->tsDefinitions(null) as $name => $def) {
-				if ($name === 'InertiaImage' || $name === 'InertiaFile') {
+				if (isset($mediaKeys[$name])) {
 					continue;
 				}
 				$definitions[$name] = $def;

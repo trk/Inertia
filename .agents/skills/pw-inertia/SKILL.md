@@ -262,7 +262,7 @@ $inertia->share([
 ## 4. 3-Tier DataProvider Pipeline (`site/inertia/*Provider.php`)
 
 Runtime serialization (`$inertia->providers()->providePage($page)`) and static type generation (`php vendor/bin/wire inertia:types`) resolve providers with "Replace, Don't Layer" precedence:
-1. **Tier 1 (Core):** `FieldtypeFieldDataProvider` (`InertiaFieldtypeInterface`), `ScalarFieldDataProvider`, `MediaFieldDataProvider`, `PageReferenceFieldDataProvider`, `RepeaterFieldDataProvider`, `OptionsFieldDataProvider`, `TemplateDataProvider`, `UserDataProvider`.
+1. **Tier 1 (Core):** `FieldtypeFieldDataProvider` (`InertiaFieldtypeInterface`), `ScalarFieldDataProvider`, `MediaFieldDataProvider` (always includes `focus: { top, left, zoom }` on `Pageimage`, and automatically appends `srcset`, `sizes`, `sources`, `lqip`, `dominantColor`, `palette`, `colorTheme`, `imageHash` + `InertiaImageFocus`, `InertiaImageSource`, `InertiaImageColorTheme` TypeScript interfaces when `InterventionImage` is installed), `PageReferenceFieldDataProvider`, `RepeaterFieldDataProvider`, `OptionsFieldDataProvider`, `TemplateDataProvider`, `UserDataProvider`.
 2. **Tier 2 (Module Hook):** `Inertia::registerProviders` calling `$inertia->registerProvider(...)`.
 3. **Tier 3 (Project Auto-Discovery):** `site/inertia/*Provider.php` under `namespace Totoglu\Inertia\Provider;`.
 

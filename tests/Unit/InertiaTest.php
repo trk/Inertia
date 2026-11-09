@@ -9,6 +9,8 @@ use ProcessWire\InputfieldWrapper;
 use ProcessWire\NoticeMessage;
 use ProcessWire\Page;
 use ProcessWire\PageArray;
+use ProcessWire\Pageimage;
+use ProcessWire\Pageimages;
 use ProcessWire\Process;
 use ProcessWire\Template;
 use ProcessWire\User;
@@ -18,6 +20,7 @@ use Totoglu\Inertia\Contracts\InertiaSerializable;
 use Totoglu\Inertia\Contracts\SsrGatewayInterface;
 use Totoglu\Inertia\InteractWithInertia;
 use Totoglu\Inertia\PageResponse;
+use Totoglu\Inertia\Provider\Field\MediaFieldDataProvider;
 use Totoglu\Inertia\Provider\Field\PageReferenceFieldDataProvider;
 use Totoglu\Inertia\Provider\Field\RepeaterFieldDataProvider;
 use Totoglu\Inertia\Provider\Field\ScalarFieldDataProvider;
@@ -1759,7 +1762,81 @@ it('validates LanguagePorter CSV files in languages/ across en, tr, de, es, fr, 
 	}
 });
 
+it('enriches Pageimage serialization and TypeScript definitions with InterventionImage responsive, LQIP, color, and hash metadata', function (): void {
+	expect(MediaFieldDataProvider::isInterventionImageInstalled())->toBeTrue();
 
+	$tsWithIntervention = MediaFieldDataProvider::defaultTsDefinitions(true);
+	$tsWithoutIntervention = MediaFieldDataProvider::defaultTsDefinitions(false);
 
+	expect($tsWithIntervention)->toHaveKeys(['InertiaImageFocus', 'InertiaImageSource', 'InertiaImageColorTheme', 'InertiaImage', 'InertiaFile'])
+		->and($tsWithIntervention['InertiaImage'])->toContain('focus: InertiaImageFocus;')
+		->and($tsWithIntervention['InertiaImage'])->toContain('srcset: string;')
+		->and($tsWithIntervention['InertiaImage'])->toContain('sources: InertiaImageSource[];')
+		->and($tsWithIntervention['InertiaImage'])->toContain('lqip: string;')
+		->and($tsWithIntervention['InertiaImage'])->toContain('dominantColor: string;')
+		->and($tsWithIntervention['InertiaImage'])->toContain('palette: string[];')
+		->and($tsWithIntervention['InertiaImage'])->toContain('colorTheme: InertiaImageColorTheme | null;')
+		->and($tsWithIntervention['InertiaImage'])->toContain('imageHash: string;')
+		->and($tsWithoutIntervention)->toHaveKeys(['InertiaImageFocus', 'InertiaImage', 'InertiaFile'])
+		->and($tsWithoutIntervention)->not->toHaveKey('InertiaImageSource')
+		->and($tsWithoutIntervention['InertiaImage'])->toContain('focus: InertiaImageFocus;')
+		->and($tsWithoutIntervention['InertiaImage'])->not->toContain('srcset: string;');
 
+	$homePage = wire('pages')->get(1);
+	$pageimages = new Pageimages($homePage);
+	$filesPath = $pageimages->path();
+	if (!is_dir($filesPath)) {
+		wire('files')->mkdir($filesPath, true);
+	}
+
+	$imgFilename = 'inertia-intervention-test-' . uniqid() . '.png';
+	$fullPath = rtrim($filesPath, '/') . '/' . $imgFilename;
+
+	$gd = imagecreatetruecolor(64, 48);
+	$blue = imagecolorallocate($gd, 30, 64, 175);
+	$cyan = imagecolorallocate($gd, 56, 189, 248);
+	imagefilledrectangle($gd, 0, 0, 32, 48, $blue);
+	imagefilledrectangle($gd, 32, 0, 64, 48, $cyan);
+	imagepng($gd, $fullPath);
+	unset($gd);
+
+	try {
+		$pageimage = new Pageimage($pageimages, $fullPath);
+		$pageimage->focus(30, 70, 10);
+
+		$serialized = MediaFieldDataProvider::formatPageimage($pageimage);
+
+		expect($serialized['name'])->toBe($imgFilename)
+			->and($serialized['width'])->toBe(64)
+			->and($serialized['height'])->toBe(48)
+			->and($serialized['focus'])->toBe([
+				'top' => 30.0,
+				'left' => 70.0,
+				'zoom' => 10,
+			])
+			->and($serialized['srcset'])->toBeString()->not->toBe('')
+			->and($serialized['sizes'])->toBeString()->not->toBe('')
+			->and($serialized['sources'])->toBeArray()
+			->and($serialized['lqip'])->toStartWith('data:image/webp;base64,')
+			->and($serialized['dominantColor'])->toMatch('/^#[0-9a-fA-F]{6}$/')
+			->and($serialized['palette'])->toBeArray()->not->toBeEmpty()
+			->and($serialized['colorTheme'])->toBeArray()->toHaveKeys([
+				'vibrant',
+				'muted',
+				'darkVibrant',
+				'darkMuted',
+				'lightVibrant',
+				'lightMuted',
+			])
+			->and($serialized['imageHash'])->toMatch('/^[0-9a-f]{16}$/');
+	} finally {
+		if (isset($pageimage) && $pageimage instanceof Pageimage) {
+			$pageimage->removeVariations();
+		}
+		$baseName = pathinfo($imgFilename, PATHINFO_FILENAME);
+		foreach (glob(rtrim($filesPath, '/') . '/' . $baseName . '*') ?: [] as $cleanupFile) {
+			@unlink($cleanupFile);
+		}
+	}
+});
 
