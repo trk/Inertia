@@ -1,0 +1,123 @@
+name: "Tag, Release"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Inertia.module.php"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag_and_release:
+    runs-on: ubuntu-latest
+    env:
+      VERSION_FILE: "Inertia.module.php"
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate PHP syntax and composer.json
+        run: |
+          find . -name "*.php" -not -path "./vendor/*" -not -path "./node_modules/*" -exec php -l {} +
+          if [ -f "composer.json" ]; then
+            composer validate --strict --no-check-publish --no-check-version
+          fi
+
+      - name: Extract module version
+        id: get_version
+        run: |
+          VERSION=$(php -r '
+            $c = file_get_contents(getenv("VERSION_FILE"));
+            if (!is_string($c) || !preg_match("/[\x27\"].*?version.*?[\x27\"]\s*=>\s*[\x27\"]?([0-9\.]+)[\x27\"]?/", $c, $m)) {
+              exit(1);
+            }
+            $v = $m[1];
+            if (is_numeric($v) && !str_contains((string) $v, ".")) {
+              $v = (int) $v;
+              $v = intdiv($v, 100) . "." . (intdiv($v, 10) % 10) . "." . ($v % 10);
+            }
+            echo $v;
+          ')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not find the version number in ${{ env.VERSION_FILE }}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          TAG="v${{ steps.get_version.outputs.version }}"
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "refs/tags/$TAG"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists on remote. Skipping release."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure Git User
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Create Git Tag and GitHub Release
+        if: steps.check_tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.get_version.outputs.version }}"
+          REPO="${{ github.repository }}"
+          echo "Generated Tag: $TAG"
+
+          git tag "$TAG"
+          git push origin "$TAG"
+
+          echo "## What's Changed" > release_notes.md
+          echo "" >> release_notes.md
+
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            COMMITS=$(git log --format="%H" "${PREV_TAG}..HEAD")
+            COMPARE_URL="https://github.com/$REPO/compare/$PREV_TAG...$TAG"
+          else
+            COMMITS=$(git log --format="%H" HEAD)
+            COMPARE_URL="https://github.com/$REPO/commits/$TAG"
+          fi
+
+          for SHA in $COMMITS; do
+            TITLE=$(git log --format="%s" -n 1 "$SHA")
+            SHORT_SHA=$(git rev-parse --short "$SHA")
+
+            LOGIN=$(gh api "repos/$REPO/commits/$SHA" --jq '.author.login // empty' 2>/dev/null || echo "")
+            if [ -z "$LOGIN" ]; then
+              LOGIN=$(git log --format="%an" -n 1 "$SHA")
+            fi
+
+            if [[ "$LOGIN" == *" "* ]]; then
+              echo "* $TITLE by **$LOGIN** in $SHORT_SHA" >> release_notes.md
+            else
+              echo "* $TITLE by @$LOGIN in $SHORT_SHA" >> release_notes.md
+            fi
+          done
+
+          echo "" >> release_notes.md
+          echo "**Full Changelog**: $COMPARE_URL" >> release_notes.md
+
+          REPO_NAME="${REPO#*/}"
+          ZIP_FILE="${REPO_NAME}.zip"
+          git archive --format=zip --prefix="${REPO_NAME}/" -o "$ZIP_FILE" HEAD
+
+          gh release create "$TAG" "$ZIP_FILE" -F release_notes.md --title "$TAG"

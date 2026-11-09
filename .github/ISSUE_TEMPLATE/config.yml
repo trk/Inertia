@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: ProcessWire Support Forum
+    url: https://processwire.com/talk/
+    about: Ask questions and discuss usage with the ProcessWire community.
+  - name: Support Question
+    url: https://totoglu.com/support
+    about: We use GitHub issues only to track Inertia module bugs and feature requests.

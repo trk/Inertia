@@ -1,0 +1,94 @@
+name: 🐛 Bug Report
+description: ⚠️ NEVER report security issues publicly, please contact us directly
+labels: ["bug"]
+
+body:
+  - type: input
+    id: affected-versions
+    attributes:
+      label: Inertia version(s) affected
+      placeholder: 1.0.0
+    validations:
+      required: true
+  - type: input
+    id: processwire-version
+    attributes:
+      label: ProcessWire version
+      placeholder: 3.0.275
+    validations:
+      required: true
+  - type: input
+    id: php-version
+    attributes:
+      label: PHP version
+      placeholder: 8.5.12
+    validations:
+      required: true
+  - type: dropdown
+    id: database
+    attributes:
+      label: Database driver
+      options:
+        - MySQL / MariaDB
+        - SQLite
+        - PostgreSQL
+      default: 0
+    validations:
+      required: true
+  - type: input
+    id: database-version
+    attributes:
+      label: Database version
+      placeholder: e.g. MySQL 8.4, MariaDB 11.4, SQLite 3.46, PostgreSQL 17
+    validations:
+      required: false
+  - type: checkboxes
+    id: multi-language
+    attributes:
+      label: Multi-language
+      options:
+        - label: Multi-language support (LanguageSupport) is installed
+          required: false
+  - type: dropdown
+    id: component-area
+    attributes:
+      label: Affected Area
+      options:
+        - Inertia v3 Page Object / Partial Reloads
+        - DeferredProp / MergeProp / OnceProp / ScrollProp
+        - DataProvider Architecture (TemplateDataProvider / FieldDataProvider / UserDataProvider)
+        - TypeGenerator / CLI Commands (inertia:install, inertia:types)
+        - ErrorBag / Flash Notices / Redirects (303 / 409)
+        - Server-Side Rendering (SSR Gateway) / Root View (_inertia.php)
+      default: 0
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear and concise description of the problem
+    validations:
+      required: true
+  - type: textarea
+    id: how-to-reproduce
+    attributes:
+      label: How to reproduce
+      description: |
+        ⚠️ This is the most important part of the report ⚠️
+        Without a way to easily reproduce your issue, there is little chance we will be able to help you and work on a fix.
+        Please take the time to share the steps, code, or configuration needed to reproduce the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: possible-solution
+    attributes:
+      label: Possible Solution
+      description: |
+        Optional: only if you have suggestions on a fix/reason for the bug.
+        Don't hesitate to create a pull request with your solution, it helps get faster feedback.
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: "Optional: any other context about the problem: log messages, screenshots, etc."

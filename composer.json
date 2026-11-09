@@ -1,0 +1,53 @@
+{
+	"name": "trk/processwire-inertia",
+	"description": "Standalone Inertia.js v3 server-side protocol adapter for ProcessWire with Deferred/Merge/Once/Scroll props, Vite versioning, and fault-tolerant SSR.",
+	"type": "pw-module",
+	"keywords": [
+		"processwire",
+		"inertia",
+		"inertiajs",
+		"spa",
+		"react",
+		"vue",
+		"svelte",
+		"vite"
+	],
+	"homepage": "https://github.com/trk/Inertia",
+	"license": "MIT",
+	"authors": [
+		{
+			"name": "Iskender TOTOGLU",
+			"email": "iskender@totoglu.com",
+			"homepage": "https://totoglu.com/"
+		}
+	],
+	"autoload": {
+		"psr-4": {
+			"Totoglu\\Inertia\\": "src/",
+			"Totoglu\\Inertia\\Commands\\": "commands/"
+		}
+	},
+	"extra": {
+		"commands": [
+			"Totoglu\\Inertia\\Commands\\InertiaTypesCommand",
+			"Totoglu\\Inertia\\Commands\\InertiaInstallCommand"
+		],
+		"processwire-console": {
+			"commands": [
+				"Totoglu\\Inertia\\Commands\\InertiaTypesCommand",
+				"Totoglu\\Inertia\\Commands\\InertiaInstallCommand"
+			]
+		}
+	},
+	"require": {
+		"php": ">=8.4",
+		"trk/processwire-vite": "^1.0"
+	},
+	"config": {
+		"process-timeout": 0,
+		"allow-plugins": {
+			"hari/pw-module": true
+		}
+	},
+	"minimum-stability": "dev"
+}
