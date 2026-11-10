@@ -633,7 +633,7 @@ it('supports Inertia v3 ScrollProp with ProcessWire PaginatedArray, X-Inertia-In
 		->and($scrollObject['matchPropsOn'])->toContain('posts.data.id', 'forum.topics.id');
 
 	// 2. X-Inertia-Infinite-Scroll-Merge-Intent: prepend switches ScrollProp to prependProps and ?page=2 syncs with ProcessWire $input->pageNum()
-	$_GET['page'] = '2';
+	wire()->input->get->set('page', '2');
 	$inertia->request->fake([
 		'X-Inertia' => 'true',
 		'X-Inertia-Infinite-Scroll-Merge-Intent' => 'prepend',
@@ -642,7 +642,7 @@ it('supports Inertia v3 ScrollProp with ProcessWire PaginatedArray, X-Inertia-In
 	$prependScrollObject = inertia('Posts/Feed', [
 		'posts' => $inertia->scroll(static fn() => wire()->pages->find('id>0, sort=id, limit=1')),
 	])->toPageObject();
-	unset($_GET['page']);
+	wire()->input->get->remove('page');
 
 	expect($prependScrollObject['prependProps'])->toBe(['posts.data'])
 		->and($prependScrollObject['scrollProps']['posts']['currentPage'])->toBe(2)
@@ -1352,18 +1352,18 @@ it('guards against circular Page graphs, unpublished/trashed Page references, un
 		return ['item-' . $scrollCalls];
 	});
 
-	$_GET['page'] = '1';
+	wire()->input->get->set('page', '1');
 	$firstScrollObj = $inertia->render('Scroll/Demo', ['items' => $scrollProp])->toPageObject();
 	expect($scrollCalls)->toBe(1)
 		->and($firstScrollObj['scrollProps']['items']['currentPage'])->toBe(1)
 		->and($firstScrollObj['props']['items']['data'])->toBe(['item-1']);
 
-	$_GET['page'] = '2';
+	wire()->input->get->set('page', '2');
 	$secondScrollObj = $inertia->render('Scroll/Demo', ['items' => $scrollProp])->toPageObject();
 	expect($scrollCalls)->toBe(2)
 		->and($secondScrollObj['scrollProps']['items']['currentPage'])->toBe(2)
 		->and($secondScrollObj['props']['items']['data'])->toBe(['item-2']);
-	unset($_GET['page']);
+	wire()->input->get->remove('page');
 
 	// 7. TemplateDataProvider::basePageData() decodes TextformatterEntities on title when configured on the title field
 	$titleField = wire()->fields->get('title');
@@ -1391,7 +1391,6 @@ it('guards against circular Page graphs, unpublished/trashed Page references, un
 	$config->demo = true;
 
 	try {
-		$_POST['title'] = 'Mutated via POST';
 		wire()->input->post->set('title', 'Mutated via WireInput');
 
 		$inertia->request->fake(
@@ -1414,14 +1413,13 @@ it('guards against circular Page graphs, unpublished/trashed Page references, un
 			'effectiveMethod' => $inertia->request->method(),
 		])->toPageObject();
 
-		expect($_POST)->toBe([])
+		expect(wire()->input->post->getArray())->toBe([])
 			->and(wire()->input->post->get('title'))->toBeNull()
 			->and($demoPageObject['props']['effectiveMethod'])->toBe('GET')
 			->and($demoPageObject['flash']['warnings'] ?? [])->toContain('Changes cannot be saved in demo mode.')
 			->and($demoPageObject['props']['flash']['warnings'] ?? [])->toContain('Changes cannot be saved in demo mode.');
 	} finally {
 		$config->demo = $prevDemo;
-		$_POST = [];
 		wire()->input->post->removeAll();
 		$inertia->resetState();
 	}
@@ -1517,11 +1515,65 @@ it('hardens SSR hydration script injection, header name sanitization, nested Err
 		->and($csrHtml)->not->toContain('onclick=')
 		->and($csrHtml)->not->toContain('bad attr');
 
+	$csrfName = (string) wire()->session->CSRF->getTokenName();
 	$expectedCsrf = (string) wire()->session->CSRF->getTokenValue();
-	$_GET['_token'] = $expectedCsrf;
-	$inertia->request->fake(['X-Inertia' => 'true'], 'POST', '');
-	expect($inertia->request->validateCsrf(false))->toBeFalse();
-	unset($_GET['_token']);
+	$prevProtectCsrf = (bool) wire()->config->protectCSRF;
+	wire()->config->protectCSRF = true;
+	try {
+		wire()->input->post->removeAll();
+		wire()->input->get->set('_token', $expectedCsrf);
+		wire()->input->get->set('filter_tab', '<b>active</b>');
+		$inertia->request->fake(['X-Inertia' => 'true'], 'POST', '');
+		expect($inertia->request->validateCsrf(false))->toBeFalse()
+			->and($inertia->request->get('filter_tab', 'text'))->toBe('active')
+			->and(wire()->session->CSRF->hasValidToken('', false))->toBeFalse();
+		wire()->input->get->remove('_token');
+		wire()->input->get->remove('filter_tab');
+
+		// Re-read token after failed validation rotated it
+		$csrfName = (string) wire()->session->CSRF->getTokenName();
+		$expectedCsrf = (string) wire()->session->CSRF->getTokenValue();
+
+		// End-to-end public seam: Inertia::ready() bridges verified X-XSRF-TOKEN (or _token when header is stale)
+		// into native $input->post so $session->CSRF->validate() succeeds automatically
+		$inertia->request->fake(
+			['X-Inertia' => 'true', 'X-XSRF-TOKEN' => 'stale-token-value'],
+			'POST',
+			json_encode([
+				'_token' => $expectedCsrf,
+				'action' => 'refresh',
+				'title' => '<b>Clean Title</b>',
+				'nested' => [
+					'email' => '  USER@EXAMPLE.COM ',
+					'toggle' => '1',
+					'tags' => ['<b>first</b>', 'second'],
+					'__proto__' => ['polluted' => true],
+				],
+				'GLOBALS' => 'blocked',
+				'__proto__' => 'blocked',
+				"bad\nkey" => 'blocked',
+			]) ?: '{}'
+		);
+		$inertia->ready();
+		expect($inertia->request->isMethod('post'))->toBeTrue()
+			->and($inertia->request->post('action', ['refresh', 'save']))->toBe('refresh')
+			->and($inertia->request->post('title', 'text'))->toBe('Clean Title')
+			->and($inertia->request->input('nested.email', null, 'email'))->toBe('USER@EXAMPLE.COM')
+			->and($inertia->request->input('nested.toggle', 0, 1))->toBe(1)
+			->and($inertia->request->input('nested.tags', null, 'text'))->toBe('first')
+			->and($inertia->request->input('GLOBALS'))->toBeNull()
+			->and($inertia->request->input('__proto__'))->toBeNull()
+			->and($inertia->request->input('nested.__proto__'))->toBeNull()
+			->and(wire()->input->post->get('GLOBALS'))->toBeNull()
+			->and(wire()->input->post->get('__proto__'))->toBeNull()
+			->and(wire()->input->post->get("bad\nkey"))->toBeNull()
+			->and(wire()->input->post->get($csrfName))->toBe($expectedCsrf)
+			->and(wire()->session->CSRF->hasValidToken('', false))->toBeTrue()
+			->and(wire()->session->CSRF->validate())->toBeTrue();
+	} finally {
+		wire()->config->protectCSRF = $prevProtectCsrf;
+		wire()->input->post->removeAll();
+	}
 
 	// 7. Partial reload of a parent group does not trigger nested OptionalProp or bypass X-Inertia-Except-Once-Props,
 	// and excluding an element from a list preserves sequential list indexing

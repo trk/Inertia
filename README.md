@@ -572,7 +572,7 @@ $wire->addHook('/contact/submit', function (HookEvent $e): mixed {
 ## 9. Multi-Language Support & Security
 
 - **Translations:** Ships with chronological ProcessWire `LanguagePorter` CSV packs in `languages/{en,tr,de,es,fr,ru}.csv`. Import via **Setup → Languages** or `$language->porter->importCsv()`.
-- **CSRF Verification:** Validates `$session->CSRF` tokens via form fields, `X-CSRF-TOKEN`, and `X-XSRF-TOKEN` headers (`$inertia->request->validateCsrf(true)`).
-- **Demo Mode (`$config->demo = true`):** Blocks state-changing requests (`POST`, `PUT`, `PATCH`, `DELETE`), purges `$_POST`, `$_FILES`, `$input->post`, and JSON bodies, downgrades `$inertia->request->method()` to `'GET'`, and disables disk type generation.
+- **CSRF Verification:** Validates `$session->CSRF` tokens via `$input->post`, `X-CSRF-TOKEN`, and `X-XSRF-TOKEN` headers (`$inertia->request->validateCsrf(true)`), and automatically bridges verified `X-XSRF-TOKEN` / `X-CSRF-TOKEN` / `_token` values into `$input->post` so native `$session->CSRF->validate()` succeeds.
+- **Demo Mode (`$config->demo = true`):** Blocks state-changing requests (`POST`, `PUT`, `PATCH`, `DELETE`), purges `$input->post`, `$_FILES`, and JSON bodies, downgrades `$inertia->request->method()` to `'GET'`, and disables disk type generation.
 - **Safe User Serialization:** `UserDataProvider` strips `pass`, salts, tokens, and system fields before serializing `User` instances.
 - **Root View Path Confinement:** Custom `rootView` paths are confined inside `$config->paths->templates` or `$config->paths->siteModules` via `realpath()` boundary checks.

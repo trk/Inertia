@@ -359,6 +359,12 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			return;
 		}
 
+		if ($this->syncJsonToPost) {
+			$this->request->syncJsonToPost();
+		} else {
+			$this->request->syncCsrfToPost();
+		}
+
 		if ($this->autoShareCsrf) {
 			$this->emitXsrfCookie();
 		}
@@ -962,7 +968,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	 */
 	public function back(string $fallbackUrl = '/', bool $terminate = false): Response
 	{
-		$referer = trim((string) ($this->request->header('Referer') ?? ($_SERVER['HTTP_REFERER'] ?? '')));
+		$referer = trim((string) ($this->request->header('Referer') ?? ''));
 		$target = ($referer !== '' && $this->isSafeBackTarget($referer)) ? $referer : $fallbackUrl;
 
 		return $this->prepareSeeOtherRedirect($target, $terminate);
@@ -1031,7 +1037,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		}
 
 		if (!$hasConfiguredHosts) {
-			$serverHost = strtolower(trim((string) ($_SERVER['HTTP_HOST'] ?? '')));
+			$serverHost = strtolower(trim((string) ($this->request->header('Host') ?? '')));
 			if ($serverHost !== '') {
 				$allowedHosts[] = $serverHost;
 				$allowedHosts[] = (string) explode(':', $serverHost)[0];
@@ -1351,6 +1357,10 @@ class Inertia extends WireData implements Module, ConfigurableModule
 
 		$pageObject = $pageResponse->toPageObject();
 
+		if ($this->autoShareCsrf) {
+			$this->emitXsrfCookie();
+		}
+
 		if ($this->request->isInertia()) {
 			$this->response->markAsInertiaJson();
 			$this->response->applyHeaders();
@@ -1472,6 +1482,11 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	protected function executeAdminProcess(HookEvent $event, Page $page): void
 	{
 		$wire = $this->wire();
+		if ($this->syncJsonToPost) {
+			$this->request->syncJsonToPost();
+		} else {
+			$this->request->syncCsrfToPost();
+		}
 		$this->enforceDemoModeGuard();
 
 		// Allow classic AdminThemeUikit flyout navigation requests (`navJSON`) to run through standard admin.php
@@ -1637,8 +1652,11 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	 */
 	protected function hookSessionRedirect(HookEvent $event): void
 	{
-		$method = $this->request->method();
-		$isInertiaWrite = $this->request->isInertia() && in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'], true);
+		if ($this->autoShareCsrf) {
+			$this->emitXsrfCookie();
+		}
+
+		$isInertiaWrite = $this->request->isInertia() && !$this->request->isDemoModeBlocked() && $this->request->isMutatingMethod();
 
 		if ($this->forceNextRedirect303 || $isInertiaWrite) {
 			$this->forceNextRedirect303 = false;
@@ -1961,23 +1979,22 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	}
 
 	/**
-	 * Resolve the current request URL including query string.
+	 * Resolve the current request URL including query string via ProcessWire's native `WireInput::url()`.
 	 */
 	protected function resolveCurrentUrl(?Page $targetPage = null): string
 	{
-		$requestUri = (string) ($_SERVER['REQUEST_URI'] ?? '');
-		if ($requestUri !== '') {
-			return $requestUri;
-		}
-
 		$wire = $this->wire();
-		$url = (string) $wire->input->url(true);
+		/** @var Page|null $page */
+		$page = $targetPage ?? $wire->page;
+
+		$url = (string) $wire->input->url([
+			'withQueryString' => true,
+			'page' => $page,
+		]);
 		if ($url !== '') {
 			return $url;
 		}
 
-		/** @var Page|null $page */
-		$page = $targetPage ?? $wire->page;
 		if ($page instanceof Page && $page->template instanceof Template && $page->url !== '') {
 			return (string) $page->url;
 		}
@@ -2051,7 +2068,8 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	}
 
 	/**
-	 * Emit the `XSRF-TOKEN` cookie on web responses so Axios / Inertia fetch automatically sends `X-XSRF-TOKEN`.
+	 * Emit the `XSRF-TOKEN` cookie on web responses via ProcessWire's native `WireInputDataCookie`
+	 * so Axios / Inertia fetch automatically sends `X-XSRF-TOKEN`.
 	 */
 	protected function emitXsrfCookie(): void
 	{
@@ -2064,14 +2082,13 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			return;
 		}
 
-		$secure = (bool) $this->wire()->config->https;
-
-		@setcookie('XSRF-TOKEN', $csrf['value'], [
-			'expires' => 0,
-			'path' => '/',
-			'secure' => $secure,
+		$this->wire()->input->cookie->set('XSRF-TOKEN', $csrf['value'], [
+			'age' => 0,
+			'path' => null,
+			'secure' => null,
 			'httponly' => false,
 			'samesite' => 'Lax',
+			'fallback' => false,
 		]);
 	}
 
@@ -2255,8 +2272,8 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	}
 
 	/**
-	 * When ProcessWire demo mode (`$config->demo = true`) is active, purge state-mutating request globals
-	 * (`$_POST`, `$_FILES`, `$input->post`, JSON body) and emit a one-time warning notice.
+	 * When ProcessWire demo mode (`$config->demo = true`) is active, purge state-mutating request input
+	 * (`$input->post`, `$_FILES`, JSON body) and emit a one-time warning notice.
 	 */
 	protected function enforceDemoModeGuard(): void
 	{
@@ -2281,10 +2298,10 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			return true;
 		}
 
-		$requestUri = (string) ($_SERVER['REQUEST_URI'] ?? '');
+		$requestUrl = (string) $wire->input->url(false);
 		$adminUrl = (string) ($wire->config->urls->admin ?: '/processwire/');
 
-		return $adminUrl !== '' && str_starts_with($requestUri, $adminUrl);
+		return $adminUrl !== '' && str_starts_with($requestUrl, $adminUrl);
 	}
 
 	protected function isTracySupportEnabled(): bool

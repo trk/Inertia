@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace Totoglu\Inertia;
 
 use ProcessWire\Wire;
+use ProcessWire\WireInput;
 use ProcessWire\WirePermissionException;
 
 /**
  * Parses inbound `X-Inertia*` HTTP headers, decodes JSON request bodies,
+ * delegates request methods and input access to ProcessWire's native `WireInput`,
  * synchronizes JSON fields into `$input->post`, and validates CSRF / `X-XSRF-TOKEN` tokens.
  */
 class Request extends Wire
@@ -18,6 +20,31 @@ class Request extends Wire
 
 	/** Maximum JSON nesting depth for `json_decode()` */
 	public const int MAX_JSON_DEPTH = 64;
+
+	/** Maximum length of an individual input key or CSRF token */
+	private const int MAX_KEY_LENGTH = 128;
+
+	private const int MAX_CSRF_TOKEN_LENGTH = 512;
+
+	/**
+	 * Reserved superglobal and prototype-pollution keys rejected when decoding JSON or syncing into `$input->post`.
+	 *
+	 * @var list<string>
+	 */
+	private const array BLOCKED_INPUT_KEYS = [
+		'GLOBALS',
+		'_GET',
+		'_POST',
+		'_COOKIE',
+		'_REQUEST',
+		'_SERVER',
+		'_ENV',
+		'_FILES',
+		'_SESSION',
+		'__proto__',
+		'constructor',
+		'prototype',
+	];
 
 	/** @var array<string, string> Test/runtime header overrides */
 	private array $headerOverrides = [];
@@ -37,6 +64,14 @@ class Request extends Wire
 	}
 
 	/**
+	 * Determine if the raw HTTP method is a state-mutating method (`POST`, `PUT`, `PATCH`, `DELETE`).
+	 */
+	public function isMutatingMethod(): bool
+	{
+		return in_array($this->rawMethod(), ['POST', 'PUT', 'PATCH', 'DELETE'], true);
+	}
+
+	/**
 	 * Determine if a state-mutating request (`POST`, `PUT`, `PATCH`, `DELETE`) is blocked by `$config->demo`.
 	 */
 	public function isDemoModeBlocked(): bool
@@ -49,11 +84,11 @@ class Request extends Wire
 			return true;
 		}
 
-		return in_array($this->rawMethod(), ['POST', 'PUT', 'PATCH', 'DELETE'], true);
+		return $this->isMutatingMethod();
 	}
 
 	/**
-	 * Mark the current request as blocked by demo mode and purge mutating superglobals (`$_POST`, `$_FILES`, `$input->post`).
+	 * Mark the current request as blocked by demo mode and purge mutating input (`$input->post`, `$_POST`, `$_FILES`).
 	 */
 	public function purgeMutatingGlobals(): void
 	{
@@ -178,9 +213,17 @@ class Request extends Wire
 	}
 
 	/**
+	 * Return ProcessWire's native `WireInput` instance (`$this->wire()->input`).
+	 */
+	public function wireInput(): WireInput
+	{
+		return $this->wire()->input;
+	}
+
+	/**
 	 * Return the effective HTTP request method in uppercase (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`).
-	 * Supports `_method` spoofing in JSON or POST payloads, and downgrades state-mutating methods to `GET`
-	 * when ProcessWire demo mode (`$config->demo = true`) is active.
+	 * Managed via ProcessWire's `WireInput::requestMethod()`, supports `_method` spoofing in JSON or `$input->post`,
+	 * and downgrades state-mutating methods to `GET` when ProcessWire demo mode (`$config->demo = true`) is active.
 	 */
 	public function method(): string
 	{
@@ -192,17 +235,31 @@ class Request extends Wire
 	}
 
 	/**
-	 * Return the raw HTTP request method (including `_method` spoofing) before demo-mode downgrading.
+	 * Check whether the effective HTTP request method matches `$method` (case-insensitive).
+	 */
+	public function isMethod(string $method): bool
+	{
+		$normalized = strtoupper(trim($method));
+		if ($normalized === '') {
+			return false;
+		}
+
+		return $this->method() === $normalized;
+	}
+
+	/**
+	 * Return the raw HTTP request method via `WireInput::requestMethod()` (including `_method` spoofing) before demo-mode downgrading.
 	 */
 	public function rawMethod(): string
 	{
+		$input = $this->wireInput();
+		$detectedMethod = (string) $input->requestMethod();
 		$baseMethod = $this->methodOverride !== null
-			? strtoupper($this->methodOverride)
-			: strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+			? strtoupper(trim($this->methodOverride))
+			: ($detectedMethod !== '' ? $detectedMethod : 'GET');
 
 		if ($baseMethod === 'POST') {
-			$spoofed = $_POST['_method']
-				?? $this->wire()->input->post->get('_method')
+			$spoofed = $input->post('_method', ['PUT', 'PATCH', 'DELETE', 'put', 'patch', 'delete'])
 				?? ($this->decodeRawJson()['_method'] ?? null)
 				?? $this->header('X-HTTP-Method-Override');
 			if (is_string($spoofed)) {
@@ -221,7 +278,7 @@ class Request extends Wire
 	 */
 	public function isJson(): bool
 	{
-		$contentType = $this->header('Content-Type') ?? (string) ($_SERVER['CONTENT_TYPE'] ?? '');
+		$contentType = $this->header('Content-Type') ?? '';
 
 		return stripos($contentType, 'application/json') !== false
 			|| stripos($contentType, '+json') !== false;
@@ -265,43 +322,174 @@ class Request extends Wire
 		}
 
 		$decoded = json_decode($raw, true, self::MAX_JSON_DEPTH);
-		$this->jsonBody = is_array($decoded) ? $decoded : [];
+		$this->jsonBody = is_array($decoded) ? $this->sanitizeJsonTree($decoded) : [];
 
 		return $this->jsonBody;
 	}
 
 	/**
-	 * Synchronize decoded JSON body fields into ProcessWire's `$input->post` and `$_POST`
-	 * so native ProcessWire form processors and `$session->CSRF` can read them directly.
+	 * Recursively strip blocked superglobal / prototype-pollution keys and control-character keys from decoded JSON.
+	 *
+	 * @param array<mixed, mixed> $data
+	 * @return array<string|int, mixed>
+	 */
+	private function sanitizeJsonTree(array $data, int $depth = 0): array
+	{
+		if ($depth >= self::MAX_JSON_DEPTH) {
+			return [];
+		}
+
+		$clean = [];
+		foreach ($data as $key => $value) {
+			if (is_string($key) && !$this->isSafeInputKey($key)) {
+				continue;
+			}
+			if (is_array($value)) {
+				$clean[$key] = $this->sanitizeJsonTree($value, $depth + 1);
+			} else {
+				$clean[$key] = $value;
+			}
+		}
+
+		return $clean;
+	}
+
+	/**
+	 * Validate that an input key is non-empty, within length limits, free of control characters,
+	 * and not a reserved superglobal or prototype-pollution identifier.
+	 */
+	private function isSafeInputKey(string $key): bool
+	{
+		if ($key === '' || strlen($key) > self::MAX_KEY_LENGTH) {
+			return false;
+		}
+
+		if (preg_match('/[\x00-\x20]/', $key) === 1) {
+			return false;
+		}
+
+		return !in_array($key, self::BLOCKED_INPUT_KEYS, true);
+	}
+
+	/**
+	 * Synchronize decoded JSON body fields and verified `X-XSRF-TOKEN` / `X-CSRF-TOKEN` headers
+	 * into ProcessWire's native `$input->post` (`WireInputData`) so ProcessWire form processors
+	 * and `$session->CSRF->validate()` can read them directly.
 	 * Skipped on read-only requests and when ProcessWire demo mode (`$config->demo = true`) is active.
 	 */
 	public function syncJsonToPost(): void
 	{
-		if ($this->isDemoMode() || !in_array($this->rawMethod(), ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
+		if ($this->isDemoMode() || !$this->isMutatingMethod()) {
 			return;
 		}
 
+		$post = $this->wireInput()->post;
 		$payload = $this->json();
-		if ($payload === []) {
-			return;
-		}
 
-		$input = $this->wire()->input;
 		foreach ($payload as $key => $value) {
-			if (!is_string($key) || $key === '' || str_contains($key, "\0")) {
+			if (!is_string($key) || !$this->isSafeInputKey($key)) {
 				continue;
 			}
-			if (!isset($_POST[$key])) {
-				$_POST[$key] = $value;
+			if ($post->get($key) === null) {
+				$post->set($key, $value);
 			}
-			if ($input->post->get($key) === null) {
-				$input->post->set($key, $value);
+		}
+
+		$this->syncCsrfToPost();
+	}
+
+	/**
+	 * Bridge a verified `X-CSRF-TOKEN`, `X-XSRF-TOKEN`, or `_token` payload value into
+	 * `$this->wire()->input->post` under ProcessWire's active CSRF token name so native
+	 * `$session->CSRF->validate()` and `$session->CSRF->hasValidToken()` succeed on Inertia requests.
+	 */
+	public function syncCsrfToPost(bool $force = false): void
+	{
+		if ($this->isDemoMode() || (!$force && !$this->isMutatingMethod())) {
+			return;
+		}
+
+		$session = $this->wire()->session;
+		if ($session === null) {
+			return;
+		}
+
+		$csrf = $session->CSRF;
+		$tokenName = (string) $csrf->getTokenName();
+		$expectedValue = (string) $csrf->getTokenValue();
+		if ($tokenName === '' || $expectedValue === '' || !$this->isSafeInputKey($tokenName)) {
+			return;
+		}
+
+		$post = $this->wireInput()->post;
+		$candidates = [
+			$post->get($tokenName),
+			$this->header('X-CSRF-TOKEN'),
+			$this->header('X-XSRF-TOKEN'),
+			$post->get('_token'),
+		];
+
+		foreach ($candidates as $candidate) {
+			if ($this->isMatchingCsrfToken($candidate, $expectedValue)) {
+				if ($post->get($tokenName) !== $expectedValue) {
+					$post->set($tokenName, $expectedValue);
+				}
+
+				return;
 			}
 		}
 	}
 
 	/**
-	 * Retrieve all request input data (merged GET, POST, and JSON body).
+	 * Verify a candidate CSRF token against the session's expected token value using timing-safe `hash_equals()`.
+	 */
+	private function isMatchingCsrfToken(mixed $candidate, string $expectedValue): bool
+	{
+		if (!is_string($candidate) || $candidate === '' || $expectedValue === '') {
+			return false;
+		}
+
+		if (strlen($candidate) > self::MAX_CSRF_TOKEN_LENGTH || preg_match('/[\x00-\x1F\x7F]/', $candidate) === 1) {
+			return false;
+		}
+
+		$decodedCandidate = rawurldecode($candidate);
+
+		return hash_equals($expectedValue, $candidate) || hash_equals($expectedValue, $decodedCandidate);
+	}
+
+	/**
+	 * Retrieve a GET parameter (or all GET parameters as `WireInputData`) via ProcessWire's native `WireInput::get()`.
+	 *
+	 * @param array<int, string|int>|string|int|callable|null $valid Sanitizer name(s), allowed values whitelist, integer toggle, or validation callback
+	 */
+	public function get(string $key = '', array|string|int|callable|null $valid = null, mixed $fallback = null): mixed
+	{
+		return $this->wireInput()->get($key, $valid, $fallback);
+	}
+
+	/**
+	 * Retrieve a POST / JSON parameter (or all POST parameters as `WireInputData`) via ProcessWire's native `WireInput::post()`.
+	 * Synchronizes JSON body fields into `$input->post` before reading, and blocks access when demo mode is active.
+	 *
+	 * @param array<int, string|int>|string|int|callable|null $valid Sanitizer name(s), allowed values whitelist, integer toggle, or validation callback
+	 */
+	public function post(string $key = '', array|string|int|callable|null $valid = null, mixed $fallback = null): mixed
+	{
+		$input = $this->wireInput();
+		if ($this->isDemoModeBlocked()) {
+			$input->post->removeAll();
+
+			return $key === '' ? $input->post : $fallback;
+		}
+
+		$this->syncJsonToPost();
+
+		return $input->post($key, $valid, $fallback);
+	}
+
+	/**
+	 * Retrieve all request input data (merged `$input->get`, `$input->post`, and JSON body).
 	 * When a state-mutating request is blocked by ProcessWire demo mode (`$config->demo = true`),
 	 * only read-only GET parameters are returned.
 	 *
@@ -309,48 +497,118 @@ class Request extends Wire
 	 */
 	public function all(): array
 	{
-		$get = is_array($_GET ?? null) ? $_GET : [];
-		$input = $this->wire()->input;
-		$get = array_merge($get, $input->get->getArray());
+		$input = $this->wireInput();
+		$get = $input->get->getArray();
 
 		if ($this->isDemoModeBlocked()) {
 			return $get;
 		}
 
-		$post = is_array($_POST ?? null) ? $_POST : [];
-		$post = array_merge($post, $input->post->getArray());
+		$post = $input->post->getArray();
 
 		return array_merge($get, $post, $this->json());
 	}
 
 	/**
-	 * Retrieve a single input parameter from JSON body, POST, or GET (supports dot-notation),
-	 * or all input data when `$key === null`.
+	 * Retrieve a single input parameter from JSON body, `$input->post`, or `$input->get` (supports dot-notation),
+	 * or all input data when `$key === null`. Optionally sanitize/validate via ProcessWire's `$sanitizer`, whitelist, or integer toggle.
+	 *
+	 * @param array<int, string|int>|string|int|callable|null $sanitizer Optional ProcessWire Sanitizer method name (e.g. `'text'`, `'int'`, `'email'`), whitelist array, integer toggle, or callback
 	 */
-	public function input(?string $key = null, mixed $default = null): mixed
+	public function input(?string $key = null, mixed $default = null, array|string|int|callable|null $sanitizer = null): mixed
 	{
 		$all = $this->all();
 		if ($key === null) {
 			return $all;
 		}
 
+		$found = false;
+		$value = null;
+
 		if (array_key_exists($key, $all)) {
-			return $all[$key];
+			$found = true;
+			$value = $all[$key];
+		} elseif (str_contains($key, '.')) {
+			$cursor = $all;
+			$found = true;
+			foreach (explode('.', $key) as $segment) {
+				if (!is_array($cursor) || !array_key_exists($segment, $cursor)) {
+					$found = false;
+					break;
+				}
+				$cursor = $cursor[$segment];
+			}
+			if ($found) {
+				$value = $cursor;
+			}
 		}
 
-		if (!str_contains($key, '.')) {
+		if (!$found || $value === null) {
 			return $default;
 		}
 
-		$cursor = $all;
-		foreach (explode('.', $key) as $segment) {
-			if (!is_array($cursor) || !array_key_exists($segment, $cursor)) {
-				return $default;
-			}
-			$cursor = $cursor[$segment];
+		if ($sanitizer === null) {
+			return $value;
 		}
 
-		return $cursor;
+		return $this->applyInputSanitizer($value, $sanitizer, $default);
+	}
+
+	/**
+	 * Apply a ProcessWire `Sanitizer` method (or CSV chain), whitelist array, integer toggle, or callable to a resolved input value.
+	 *
+	 * @param array<int, string|int>|string|int|callable $sanitizer
+	 */
+	private function applyInputSanitizer(mixed $value, array|string|int|callable $sanitizer, mixed $default = null): mixed
+	{
+		if (is_callable($sanitizer)) {
+			$result = $sanitizer($value);
+
+			return $result ?? $default;
+		}
+
+		if (is_int($sanitizer)) {
+			if (is_scalar($value) && ctype_digit((string) $value) && (int) $value === $sanitizer) {
+				return $sanitizer;
+			}
+
+			return $default;
+		}
+
+		if (is_array($sanitizer)) {
+			while (is_array($value)) {
+				$value = $value !== [] ? reset($value) : null;
+			}
+			if (is_scalar($value)) {
+				foreach ($sanitizer as $allowed) {
+					if ((string) $allowed === (string) $value) {
+						return $allowed;
+					}
+				}
+			}
+
+			return $default;
+		}
+
+		$pwSanitizer = $this->wire()->sanitizer;
+		$allSanitizers = $pwSanitizer->getAll(true);
+		$current = $value;
+
+		foreach (explode(',', $sanitizer) as $method) {
+			$methodName = trim($method);
+			if ($methodName === '') {
+				continue;
+			}
+			$returnType = is_array($allSanitizers) ? (string) ($allSanitizers[$methodName] ?? '') : '';
+			if (!str_contains($returnType, 'a')) {
+				while (is_array($current)) {
+					$current = $current !== [] ? reset($current) : '';
+				}
+			}
+			$current = $pwSanitizer->sanitize($current, $methodName);
+		}
+
+		return $current ?? $default;
 	}
 
 	/**
@@ -363,7 +621,7 @@ class Request extends Wire
 			return (int) $val;
 		}
 
-		$pageNum = (int) $this->wire()->input->pageNum();
+		$pageNum = (int) $this->wireInput()->pageNum();
 		if ($pageNum >= 1) {
 			return $pageNum;
 		}
@@ -372,7 +630,7 @@ class Request extends Wire
 	}
 
 	/**
-	 * Validate ProcessWire's CSRF token from native POST/header or `X-XSRF-TOKEN` / `X-CSRF-TOKEN`.
+	 * Validate ProcessWire's CSRF token from native `$input->post` or `X-XSRF-TOKEN` / `X-CSRF-TOKEN` headers.
 	 *
 	 * @throws WirePermissionException
 	 */
@@ -386,33 +644,26 @@ class Request extends Wire
 			return false;
 		}
 
-		$this->syncJsonToPost();
-
-		$csrf = $this->wire()->session->CSRF;
-
-		// Check X-XSRF-TOKEN or X-CSRF-TOKEN header or POST/JSON body (never $_GET) against ProcessWire's expected token value
-		$tokenName = (string) $csrf->getTokenName();
-		$expectedValue = (string) $csrf->getTokenValue();
-		$post = $this->wire()->input->post;
-
-		$candidate = $this->header('X-CSRF-TOKEN')
-			?? $this->header('X-XSRF-TOKEN')
-			?? $post->get($tokenName)
-			?? $post->get('_token')
-			?? ($_POST[$tokenName] ?? null)
-			?? ($_POST['_token'] ?? null);
-
-		if (is_string($candidate) && $candidate !== '') {
-			$decodedCandidate = rawurldecode($candidate);
-			if ($expectedValue !== '' && (hash_equals($expectedValue, $candidate) || hash_equals($expectedValue, $decodedCandidate))) {
-				return true;
-			}
+		if (!$this->wire()->config->protectCSRF) {
+			return true;
 		}
 
+		$this->syncJsonToPost();
+		$this->syncCsrfToPost(true);
+
+		$session = $this->wire()->session;
+		if ($session === null) {
+			return false;
+		}
+
+		$csrf = $session->CSRF;
 		$valid = (bool) $csrf->hasValidToken('', false);
 
-		if (!$valid && $throwException) {
-			throw new WirePermissionException($this->_('Request security validation failed. Please refresh the page and try again.'));
+		if (!$valid) {
+			$csrf->resetToken();
+			if ($throwException) {
+				throw new WirePermissionException($this->_('Request security validation failed. Please refresh the page and try again.'));
+			}
 		}
 
 		return $valid;
@@ -447,8 +698,10 @@ class Request extends Wire
 			}
 		}
 
+		$upperSnake = strtoupper(str_replace('-', '_', $canonical));
 		$serverKeys = [
-			'HTTP_' . strtoupper(str_replace('-', '_', $canonical)),
+			'HTTP_' . $upperSnake,
+			$upperSnake,
 			$name,
 		];
 		foreach ($serverKeys as $serverKey) {
