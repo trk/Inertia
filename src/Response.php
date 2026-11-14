@@ -26,14 +26,72 @@ final class Response implements Stringable
 		return str_replace(["\r", "\n", "\0"], '', $value);
 	}
 
+	/**
+	 * Enforce an explicit navigation URL allowlist before emitting `Location`,
+	 * `X-Inertia-Location`, or `X-Inertia-Redirect` headers.
+	 *
+	 * Allows relative paths/queries/fragments starting with `/`, `?`, `#`, relative paths
+	 * without `:`, `//`, `\`, or `http://` / `https://` URLs with non-empty host and empty user/pass.
+	 */
+	public function sanitizeNavigationUrl(string $url): string
+	{
+		$clean = $this->safeHeaderValue(trim($url));
+		if ($clean === '' || preg_match('/[\x00-\x1F\x7F]/', $clean) === 1) {
+			return '/';
+		}
+
+		if ($clean[0] === '?' || $clean[0] === '#') {
+			return $clean;
+		}
+
+		$beforeQueryOrHash = (string) strtok($clean, '?#');
+		if (str_contains($beforeQueryOrHash, '\\')) {
+			return '/';
+		}
+
+		if ($clean[0] === '/') {
+			if (str_starts_with($clean, '//')) {
+				return '/';
+			}
+
+			return $clean;
+		}
+
+		if (preg_match('#^https?://#i', $clean) === 1) {
+			$parts = parse_url($clean);
+			if (
+				!is_array($parts)
+				|| !in_array(strtolower((string) ($parts['scheme'] ?? '')), ['http', 'https'], true)
+				|| empty($parts['host'])
+				|| isset($parts['user'])
+				|| isset($parts['pass'])
+			) {
+				return '/';
+			}
+
+			return $clean;
+		}
+
+		if (
+			$beforeQueryOrHash === ''
+			|| str_contains($beforeQueryOrHash, ':')
+			|| str_contains($beforeQueryOrHash, '//')
+		) {
+			return '/';
+		}
+
+		return $clean;
+	}
+
 	public function setHeader(string $name, string $value, bool $emitNow = true): self
 	{
-		$cleanName = trim(str_replace(["\r", "\n", "\0", ':'], '', $name));
+		$cleanName = (string) preg_replace('/[^!#$%&\'*+.^_`|~0-9A-Za-z-]/', '', trim($name));
 		if ($cleanName === '') {
 			return $this;
 		}
 
-		$clean = $this->safeHeaderValue($value);
+		$isNavHeader = in_array(strtolower($cleanName), ['location', 'x-inertia-location', 'x-inertia-redirect'], true);
+		$clean = $isNavHeader ? $this->sanitizeNavigationUrl($value) : $this->safeHeaderValue($value);
 		foreach (array_keys($this->headers) as $existingKey) {
 			if ($existingKey !== $cleanName && strcasecmp($existingKey, $cleanName) === 0) {
 				unset($this->headers[$existingKey], $this->emittedHeaders[$existingKey]);
@@ -86,13 +144,67 @@ final class Response implements Stringable
 	}
 
 	/**
+	 * Append one or more comma-separated header names to the outgoing `Vary` header without overwriting existing tokens.
+	 */
+	public function vary(string $header = 'X-Inertia', bool $emitNow = true): self
+	{
+		$existing = $this->getHeader('Vary');
+		if ($existing !== null && trim($existing) === '*') {
+			return $this;
+		}
+
+		$sources = [];
+		if ($existing !== null && trim($existing) !== '') {
+			$sources[] = $existing;
+		}
+		if (PHP_SAPI !== 'cli' && function_exists('headers_list')) {
+			foreach (headers_list() as $rawHeaderLine) {
+				if (stripos($rawHeaderLine, 'Vary:') === 0) {
+					$sapiVary = trim(substr($rawHeaderLine, 5));
+					if ($sapiVary === '*') {
+						return $this->setHeader('Vary', '*', $emitNow);
+					}
+					if ($sapiVary !== '') {
+						$sources[] = $sapiVary;
+					}
+				}
+			}
+		}
+		$sources[] = $header;
+
+		$tokens = [];
+		$seen = [];
+		foreach ($sources as $src) {
+			foreach (explode(',', $src) as $rawToken) {
+				$cleanToken = (string) preg_replace('/[^!#$%&\'*+.^_`|~0-9A-Za-z-]/', '', trim($rawToken));
+				if ($cleanToken === '*') {
+					return $this->setHeader('Vary', '*', $emitNow);
+				}
+				if ($cleanToken !== '') {
+					$lower = strtolower($cleanToken);
+					if (!isset($seen[$lower])) {
+						$seen[$lower] = true;
+						$tokens[] = $cleanToken;
+					}
+				}
+			}
+		}
+
+		if ($tokens !== []) {
+			$this->setHeader('Vary', implode(', ', $tokens), $emitNow);
+		}
+
+		return $this;
+	}
+
+	/**
 	 * Configure headers for an Inertia JSON response (`X-Inertia: true`, `Vary: X-Inertia`, `Content-Type: application/json`),
 	 * preserving any existing 4xx/5xx status code.
 	 */
 	public function markAsInertiaJson(bool $emitNow = true): self
 	{
 		$this->setHeader('X-Inertia', 'true', $emitNow);
-		$this->setHeader('Vary', 'X-Inertia', $emitNow);
+		$this->vary('X-Inertia', $emitNow);
 		$this->setHeader('Content-Type', 'application/json; charset=utf-8', $emitNow);
 
 		if ($this->statusCode === null) {
@@ -110,6 +222,8 @@ final class Response implements Stringable
 	public function conflictLocation(string $url, bool $emitNow = true): self
 	{
 		$this->setStatusCode(409, $emitNow);
+		$this->vary('X-Inertia', $emitNow);
+		$this->setHeader('Cache-Control', 'no-store, private', $emitNow);
 		$this->setHeader('X-Inertia-Location', $url, $emitNow);
 
 		return $this;
@@ -121,6 +235,8 @@ final class Response implements Stringable
 	public function conflictRedirect(string $url, bool $emitNow = true): self
 	{
 		$this->setStatusCode(409, $emitNow);
+		$this->vary('X-Inertia', $emitNow);
+		$this->setHeader('Cache-Control', 'no-store, private', $emitNow);
 		$this->setHeader('X-Inertia-Redirect', $url, $emitNow);
 
 		return $this;

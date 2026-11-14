@@ -21,6 +21,7 @@ final class InertiaTracyPanel extends Wire implements IBarPanel
 	 */
 	public function __construct(callable $provider)
 	{
+		parent::__construct();
 		$this->provider = Closure::fromCallable($provider);
 	}
 
@@ -54,7 +55,7 @@ final class InertiaTracyPanel extends Wire implements IBarPanel
 		$rows = '';
 		foreach ($data as $k => $v) {
 			if (is_array($v) || is_object($v)) {
-				$v = json_encode($v, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+				$v = json_encode($v, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT | JSON_INVALID_UTF8_SUBSTITUTE);
 				$cell = '<pre style="margin:0; max-height:240px; overflow:auto; font-size:11px;">'
 					. $sanitizer->entities((string) $v)
 					. '</pre>';

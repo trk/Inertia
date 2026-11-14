@@ -19,6 +19,28 @@ final class ErrorBag extends Wire
 	public const string SESSION_NAMESPACE = Inertia::SESSION_NAMESPACE;
 	public const string SESSION_KEY = 'errors';
 
+	private const int MAX_NORMALIZE_DEPTH = 16;
+
+	/**
+	 * Reserved superglobal and prototype-pollution identifiers rejected as error bag or field keys.
+	 *
+	 * @var list<string>
+	 */
+	private const array BLOCKED_BAG_KEYS = [
+		'__proto__',
+		'constructor',
+		'prototype',
+		'GLOBALS',
+		'_GET',
+		'_POST',
+		'_COOKIE',
+		'_REQUEST',
+		'_SERVER',
+		'_ENV',
+		'_FILES',
+		'_SESSION',
+	];
+
 	/** @var array<string, mixed> In-memory errors queued during current request */
 	private array $runtimeErrors = [];
 
@@ -38,7 +60,7 @@ final class ErrorBag extends Wire
 			return $this;
 		}
 
-		$targetBag = $bag !== null && trim($bag) !== '' ? trim($bag) : null;
+		$targetBag = self::sanitizeBagName($bag);
 
 		if ($targetBag !== null) {
 			$existing = is_array($this->runtimeErrors[$targetBag] ?? null) ? $this->runtimeErrors[$targetBag] : [];
@@ -72,8 +94,8 @@ final class ErrorBag extends Wire
 			return (object) [];
 		}
 
-		$bag = $headerErrorBag !== null ? trim($headerErrorBag) : '';
-		if ($bag !== '' && !isset($errors[$bag]) && self::isFlatErrorMap($errors)) {
+		$bag = self::sanitizeBagName($headerErrorBag);
+		if ($bag !== null && !isset($errors[$bag]) && self::isFlatErrorMap($errors)) {
 			return [
 				$bag => $errors,
 			];
@@ -161,7 +183,31 @@ final class ErrorBag extends Wire
 			}
 		}
 
-		return $result;
+		/** @var array<string, string> $normalized */
+		$normalized = self::normalizeArray($result);
+
+		return $normalized;
+	}
+
+	/**
+	 * Validate an optional error bag identifier (`X-Inertia-Error-Bag` or `$bag` argument).
+	 */
+	private static function sanitizeBagName(?string $bag): ?string
+	{
+		if ($bag === null) {
+			return null;
+		}
+
+		$trimmed = trim($bag);
+		if (
+			$trimmed === ''
+			|| preg_match('/^[a-zA-Z0-9_.-]{1,64}$/', $trimmed) !== 1
+			|| in_array($trimmed, self::BLOCKED_BAG_KEYS, true)
+		) {
+			return null;
+		}
+
+		return $trimmed;
 	}
 
 	/**
@@ -171,12 +217,22 @@ final class ErrorBag extends Wire
 	 * @param array<string, mixed> $errors
 	 * @return array<string, mixed>
 	 */
-	private static function normalizeArray(array $errors): array
+	private static function normalizeArray(array $errors, int $depth = 0): array
 	{
+		if ($depth >= self::MAX_NORMALIZE_DEPTH) {
+			return [];
+		}
+
 		$normalized = [];
 
 		foreach ($errors as $key => $value) {
-			if (!is_string($key) || $key === '') {
+			if (
+				!is_string($key)
+				|| $key === ''
+				|| strlen($key) > 128
+				|| preg_match('/[\x00-\x20\x7F]/', $key) === 1
+				|| in_array($key, self::BLOCKED_BAG_KEYS, true)
+			) {
 				continue;
 			}
 
@@ -192,7 +248,7 @@ final class ErrorBag extends Wire
 						$normalized[$key] = (string) $first;
 					}
 				} else {
-					$nested = self::normalizeArray($value);
+					$nested = self::normalizeArray($value, $depth + 1);
 					if ($nested !== []) {
 						$normalized[$key] = $nested;
 					}

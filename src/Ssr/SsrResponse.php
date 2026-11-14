@@ -23,6 +23,12 @@ final readonly class SsrResponse
 	 */
 	public function headMarkup(): string
 	{
-		return implode("\n", $this->head);
+		return implode(
+			"\n",
+			array_map(
+				static fn (string $tag): string => (string) preg_replace('/<\/head\b/i', '&lt;/head', $tag),
+				$this->head
+			)
+		);
 	}
 }

@@ -141,22 +141,6 @@ class PageResponse extends Wire implements JsonSerializable, Stringable
 		return $this;
 	}
 
-	/**
-	 * When called with no arguments, returns all Root View variables registered on this response.
-	 * When called with `$key` (and optional `$value`), acts as a fluent alias for `withViewData()`.
-	 *
-	 * @param string|array<string, mixed>|null $key
-	 * @return ($key is null ? array<string, mixed> : self)
-	 */
-	public function viewData(string|array|null $key = null, mixed $value = null): array|self
-	{
-		if ($key === null) {
-			return $this->viewData;
-		}
-
-		return $this->withViewData($key, $value);
-	}
-
 	public function getViewData(?string $key = null, mixed $default = null): mixed
 	{
 		if ($key === null) {
@@ -296,9 +280,12 @@ class PageResponse extends Wire implements JsonSerializable, Stringable
 	 */
 	public function toJson(): string
 	{
-		$encoded = json_encode($this->toPageObject(), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+		$encoded = json_encode(
+			$this->toPageObject(),
+			JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_INVALID_UTF8_SUBSTITUTE
+		);
 
-		return is_string($encoded) ? str_replace('</', '<\/', $encoded) : '{}';
+		return is_string($encoded) ? $encoded : '{}';
 	}
 
 	/**

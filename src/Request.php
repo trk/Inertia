@@ -7,6 +7,7 @@ namespace Totoglu\Inertia;
 use ProcessWire\Wire;
 use ProcessWire\WireInput;
 use ProcessWire\WirePermissionException;
+use Throwable;
 
 /**
  * Parses inbound `X-Inertia*` HTTP headers, decodes JSON request bodies,
@@ -17,6 +18,12 @@ class Request extends Wire
 {
 	/** Maximum JSON request body size read from `php://input` (10 MB) */
 	public const int MAX_JSON_BYTES = 10_485_760;
+
+	/** Maximum URL-encoded form body size read from `php://input` on non-POST mutating verbs (1 MB) */
+	public const int MAX_FORM_BYTES = 1_048_576;
+
+	/** Maximum number of URL-encoded form parameters parsed from `php://input` on non-POST mutating verbs */
+	private const int MAX_FORM_VARS = 1000;
 
 	/** Maximum JSON nesting depth for `json_decode()` */
 	public const int MAX_JSON_DEPTH = 64;
@@ -52,15 +59,20 @@ class Request extends Wire
 	/** @var array<string, mixed>|null Cached parsed JSON body */
 	private ?array $jsonBody = null;
 
+	/** @var array<string, mixed>|null Cached parsed URL-encoded form body for non-POST mutating verbs */
+	private ?array $formBody = null;
+
 	private ?string $rawBodyOverride = null;
 
 	private ?string $methodOverride = null;
+
+	private ?string $preDemoMethod = null;
 
 	private bool $demoBlocked = false;
 
 	public function isDemoMode(): bool
 	{
-		return (bool) $this->wire()->config->demo;
+		return (bool) ($this->wire()?->config?->demo ?? false);
 	}
 
 	/**
@@ -92,17 +104,26 @@ class Request extends Wire
 	 */
 	public function purgeMutatingGlobals(): void
 	{
+		$currentRaw = $this->rawMethod();
+		if ($currentRaw !== 'GET') {
+			$this->preDemoMethod = $currentRaw;
+			if (empty($_SERVER['PW_DEMO_ORIGINAL_METHOD'])) {
+				$_SERVER['PW_DEMO_ORIGINAL_METHOD'] = $currentRaw;
+			}
+		}
 		$this->demoBlocked = true;
 		$this->jsonBody = [];
+		$this->formBody = [];
 		$_POST = [];
 		$_FILES = [];
+		$_REQUEST = $_GET;
 		unset(
 			$_SERVER['HTTP_X_FIELDNAME'],
 			$_SERVER['HTTP_X_FILENAME'],
 			$_SERVER['HTTP_X_HTTP_METHOD_OVERRIDE']
 		);
 		$_SERVER['REQUEST_METHOD'] = 'GET';
-		$this->wire()->input->post->removeAll();
+		$this->wireInput()?->post->removeAll();
 	}
 
 	/**
@@ -114,11 +135,22 @@ class Request extends Wire
 	}
 
 	/**
-	 * Determine if the inbound request is a prefetch visit (`Purpose: prefetch`).
+	 * Determine if the inbound request is a prefetch visit (`Purpose: prefetch` or `Sec-Purpose: prefetch`).
 	 */
 	public function isPrefetch(): bool
 	{
-		return strtolower(trim((string) ($this->header('Purpose') ?? ''))) === 'prefetch';
+		if (strtolower(trim((string) ($this->header('Purpose') ?? ''))) === 'prefetch') {
+			return true;
+		}
+
+		foreach ($this->parseCsvHeader($this->header('Sec-Purpose')) as $directive) {
+			$token = strtolower(trim((string) strtok($directive, ';')));
+			if ($token === 'prefetch') {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**
@@ -142,6 +174,10 @@ class Request extends Wire
 	 */
 	public function isPartial(?string $component = null): bool
 	{
+		if (!$this->isInertia()) {
+			return false;
+		}
+
 		$partialComponent = $this->partialComponent();
 		if ($partialComponent === null || $partialComponent === '') {
 			return false;
@@ -213,11 +249,19 @@ class Request extends Wire
 	}
 
 	/**
-	 * Return ProcessWire's native `WireInput` instance (`$this->wire()->input`).
+	 * Return ProcessWire's native `WireInput` instance (`$this->wire()->input`) when available.
 	 */
-	public function wireInput(): WireInput
+	public function wireInput(): ?WireInput
 	{
-		return $this->wire()->input;
+		try {
+			$input = $this->wire()?->input;
+
+			return $input instanceof WireInput ? $input : null;
+		} catch (Throwable $e) {
+			$this->logRequestError('wireInput', $e);
+
+			return null;
+		}
 	}
 
 	/**
@@ -248,20 +292,73 @@ class Request extends Wire
 	}
 
 	/**
-	 * Return the raw HTTP request method via `WireInput::requestMethod()` (including `_method` spoofing) before demo-mode downgrading.
+	 * Determine whether the effective HTTP request method is `POST`.
+	 */
+	public function isPost(): bool
+	{
+		return $this->isMethod('POST');
+	}
+
+	/**
+	 * Return the sanitized current request URL (including query string) via `WireInput::url(true)`.
+	 */
+	public function uri(): string
+	{
+		$input = $this->wireInput();
+		if ($input !== null && method_exists($input, 'url')) {
+			try {
+				return (string) $input->url(true);
+			} catch (Throwable $e) {
+				$this->logRequestError('uri', $e);
+
+				return '';
+			}
+		}
+
+		return '';
+	}
+
+	/**
+	 * Return the raw HTTP request method via `WireInput::requestMethod()` (with `$_SERVER['REQUEST_METHOD']` fallback for `PATCH`
+	 * and `_method` spoofing on `POST`) before demo-mode downgrading.
 	 */
 	public function rawMethod(): string
 	{
+		if (
+			$this->methodOverride === null
+			&& $this->isDemoMode()
+			&& strtoupper(trim((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'))) === 'GET'
+		) {
+			if ($this->demoBlocked && $this->preDemoMethod !== null) {
+				return $this->preDemoMethod;
+			}
+
+			$preserved = $_SERVER['PW_DEMO_ORIGINAL_METHOD'] ?? null;
+			if (is_string($preserved)) {
+				$normalizedPreserved = strtoupper(trim($preserved));
+				if (in_array($normalizedPreserved, ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
+					$this->preDemoMethod = $normalizedPreserved;
+					$this->demoBlocked = true;
+
+					return $normalizedPreserved;
+				}
+			}
+		}
+
 		$input = $this->wireInput();
-		$detectedMethod = (string) $input->requestMethod();
-		$baseMethod = $this->methodOverride !== null
-			? strtoupper(trim($this->methodOverride))
-			: ($detectedMethod !== '' ? $detectedMethod : 'GET');
+		$baseMethod = $this->resolveUnspoofedVerb();
 
 		if ($baseMethod === 'POST') {
-			$spoofed = $input->post('_method', ['PUT', 'PATCH', 'DELETE', 'put', 'patch', 'delete'])
-				?? ($this->decodeRawJson()['_method'] ?? null)
-				?? $this->header('X-HTTP-Method-Override');
+			$postSpoof = $input !== null ? $input->post('_method') : null;
+			$jsonSpoof = ($this->isJson() || ($this->rawBodyOverride !== null && !$this->isUrlEncodedForm()))
+				? ($this->decodeRawJson()['_method'] ?? null)
+				: null;
+			$headerSpoof = $this->header('X-HTTP-Method-Override');
+			$spoofed = (is_string($postSpoof) && trim($postSpoof) !== '')
+				? $postSpoof
+				: ((is_string($jsonSpoof) && trim($jsonSpoof) !== '')
+					? $jsonSpoof
+					: ((is_string($headerSpoof) && trim($headerSpoof) !== '') ? $headerSpoof : null));
 			if (is_string($spoofed)) {
 				$candidate = strtoupper(trim($spoofed));
 				if (in_array($candidate, ['PUT', 'PATCH', 'DELETE'], true)) {
@@ -274,6 +371,50 @@ class Request extends Wire
 	}
 
 	/**
+	 * Resolve the unspoofed HTTP verb (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`)
+	 * without reading or decoding the request body.
+	 */
+	private function resolveUnspoofedVerb(): string
+	{
+		if ($this->methodOverride !== null) {
+			$override = strtoupper(trim($this->methodOverride));
+
+			return $override !== '' ? $override : 'GET';
+		}
+
+		if ($this->isDemoMode() && strtoupper(trim((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'))) === 'GET') {
+			if ($this->preDemoMethod !== null) {
+				return $this->preDemoMethod;
+			}
+			$preserved = $_SERVER['PW_DEMO_ORIGINAL_METHOD'] ?? null;
+			if (is_string($preserved)) {
+				$normalized = strtoupper(trim($preserved));
+				if (in_array($normalized, ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
+					return $normalized;
+				}
+			}
+		}
+
+		$input = $this->wireInput();
+		if ($input !== null && method_exists($input, 'requestMethod')) {
+			try {
+				$detectedMethod = strtoupper(trim((string) $input->requestMethod()));
+				if ($detectedMethod !== '') {
+					return $detectedMethod;
+				}
+			} catch (Throwable $e) {
+				$this->logRequestError('requestMethod', $e);
+			}
+		}
+
+		$serverMethod = strtoupper(trim((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')));
+
+		return in_array($serverMethod, ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'], true)
+			? $serverMethod
+			: 'GET';
+	}
+
+	/**
 	 * Determine whether the current request has a JSON content type.
 	 */
 	public function isJson(): bool
@@ -282,6 +423,16 @@ class Request extends Wire
 
 		return stripos($contentType, 'application/json') !== false
 			|| stripos($contentType, '+json') !== false;
+	}
+
+	/**
+	 * Determine whether the current request has an `application/x-www-form-urlencoded` content type.
+	 */
+	public function isUrlEncodedForm(): bool
+	{
+		$contentType = $this->header('Content-Type') ?? '';
+
+		return stripos($contentType, 'application/x-www-form-urlencoded') !== false;
 	}
 
 	/**
@@ -300,6 +451,52 @@ class Request extends Wire
 	}
 
 	/**
+	 * Decode bounded `application/x-www-form-urlencoded` request bodies sent via `php://input`
+	 * on non-`POST` mutating verbs (`PUT`, `PATCH`, `DELETE`) where PHP SAPI leaves `$_POST` empty.
+	 *
+	 * @return array<string, mixed>
+	 */
+	private function decodeRawFormBody(): array
+	{
+		if ($this->formBody !== null) {
+			return $this->formBody;
+		}
+
+		if (!$this->isUrlEncodedForm()) {
+			return $this->formBody = [];
+		}
+
+		$verb = $this->resolveUnspoofedVerb();
+		if (!in_array($verb, ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
+			return $this->formBody = [];
+		}
+
+		$raw = $this->rawBodyOverride;
+		if ($raw === null) {
+			if (!in_array($verb, ['PUT', 'PATCH', 'DELETE'], true)) {
+				return $this->formBody = [];
+			}
+			$stream = @file_get_contents('php://input', false, null, 0, self::MAX_FORM_BYTES + 1);
+			$raw = is_string($stream) ? $stream : '';
+		}
+
+		if (
+			trim($raw) === ''
+			|| strlen($raw) > self::MAX_FORM_BYTES
+			|| substr_count($raw, '&') >= self::MAX_FORM_VARS
+			|| (substr_count($raw, '[') + substr_count(strtolower($raw), '%5b')) > 256
+		) {
+			return $this->formBody = [];
+		}
+
+		$parsed = [];
+		parse_str($raw, $parsed);
+		$this->formBody = is_array($parsed) ? $this->sanitizeJsonTree($parsed) : [];
+
+		return $this->formBody;
+	}
+
+	/**
 	 * @return array<string, mixed>
 	 */
 	private function decodeRawJson(): array
@@ -308,13 +505,19 @@ class Request extends Wire
 			return $this->jsonBody;
 		}
 
+		if (!in_array($this->resolveUnspoofedVerb(), ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
+			return $this->jsonBody = [];
+		}
+
 		$raw = $this->rawBodyOverride;
 		if ($raw === null) {
 			if (!$this->isJson()) {
 				return $this->jsonBody = [];
 			}
-			$stream = @file_get_contents('php://input', false, null, 0, self::MAX_JSON_BYTES);
+			$stream = @file_get_contents('php://input', false, null, 0, self::MAX_JSON_BYTES + 1);
 			$raw = is_string($stream) ? $stream : '';
+		} elseif (!$this->isJson() && $this->isUrlEncodedForm()) {
+			return $this->jsonBody = [];
 		}
 
 		if (trim($raw) === '' || strlen($raw) > self::MAX_JSON_BYTES) {
@@ -364,7 +567,7 @@ class Request extends Wire
 			return false;
 		}
 
-		if (preg_match('/[\x00-\x20]/', $key) === 1) {
+		if (preg_match('/[\x00-\x20\x7F]/', $key) === 1) {
 			return false;
 		}
 
@@ -372,9 +575,9 @@ class Request extends Wire
 	}
 
 	/**
-	 * Synchronize decoded JSON body fields and verified `X-XSRF-TOKEN` / `X-CSRF-TOKEN` headers
-	 * into ProcessWire's native `$input->post` (`WireInputData`) so ProcessWire form processors
-	 * and `$session->CSRF->validate()` can read them directly.
+	 * Synchronize decoded JSON body fields, non-`POST` URL-encoded form bodies (`PUT`, `PATCH`, `DELETE`),
+	 * and verified `X-XSRF-TOKEN` / `X-CSRF-TOKEN` headers into ProcessWire's native `$input->post`
+	 * (`WireInputData`) so ProcessWire form processors and `$session->CSRF->validate()` can read them directly.
 	 * Skipped on read-only requests and when ProcessWire demo mode (`$config->demo = true`) is active.
 	 */
 	public function syncJsonToPost(): void
@@ -383,8 +586,19 @@ class Request extends Wire
 			return;
 		}
 
-		$post = $this->wireInput()->post;
-		$payload = $this->json();
+		$input = $this->wireInput();
+		if ($input === null) {
+			return;
+		}
+
+		$post = $input->post;
+		if ($this->isUrlEncodedForm()) {
+			$payload = $this->decodeRawFormBody();
+		} elseif ($this->isJson() || $this->rawBodyOverride !== null) {
+			$payload = $this->json();
+		} else {
+			$payload = [];
+		}
 
 		foreach ($payload as $key => $value) {
 			if (!is_string($key) || !$this->isSafeInputKey($key)) {
@@ -399,7 +613,7 @@ class Request extends Wire
 	}
 
 	/**
-	 * Bridge a verified `X-CSRF-TOKEN`, `X-XSRF-TOKEN`, or `_token` payload value into
+	 * Bridge a verified `X-CSRF-TOKEN`, `X-XSRF-TOKEN`, `X-{tokenName}`, or `_token` payload value into
 	 * `$this->wire()->input->post` under ProcessWire's active CSRF token name so native
 	 * `$session->CSRF->validate()` and `$session->CSRF->hasValidToken()` succeed on Inertia requests.
 	 */
@@ -409,7 +623,11 @@ class Request extends Wire
 			return;
 		}
 
-		$session = $this->wire()->session;
+		if ($force && !$this->isMutatingMethod()) {
+			return;
+		}
+
+		$session = $this->wire()?->session;
 		if ($session === null) {
 			return;
 		}
@@ -421,12 +639,24 @@ class Request extends Wire
 			return;
 		}
 
-		$post = $this->wireInput()->post;
+		$input = $this->wireInput();
+		if ($input === null) {
+			return;
+		}
+
+		$post = $input->post;
+		$jsonPayload = ($this->isJson() || ($this->rawBodyOverride !== null && !$this->isUrlEncodedForm())) ? $this->decodeRawJson() : [];
+		$formPayload = (!$this->isJson() && $this->isUrlEncodedForm()) ? $this->decodeRawFormBody() : [];
 		$candidates = [
 			$post->get($tokenName),
 			$this->header('X-CSRF-TOKEN'),
 			$this->header('X-XSRF-TOKEN'),
+			$this->header('X-' . $tokenName),
 			$post->get('_token'),
+			$formPayload[$tokenName] ?? null,
+			$formPayload['_token'] ?? null,
+			$jsonPayload[$tokenName] ?? null,
+			$jsonPayload['_token'] ?? null,
 		];
 
 		foreach ($candidates as $candidate) {
@@ -441,19 +671,43 @@ class Request extends Wire
 	}
 
 	/**
+	 * Determine whether automatic JSON-to-`$input->post` synchronization is enabled on the `Inertia` module.
+	 */
+	private function shouldSyncJsonToPost(): bool
+	{
+		try {
+			$modules = $this->wire()?->modules;
+			if ($modules !== null && $modules->isInstalled('Inertia')) {
+				$inertia = $modules->get('Inertia');
+				if (is_object($inertia) && method_exists($inertia, 'get')) {
+					return (bool) ($inertia->get('syncJsonToPost') ?? true);
+				}
+			}
+		} catch (Throwable $e) {
+			$this->logRequestError('shouldSyncJsonToPost', $e);
+		}
+
+		return true;
+	}
+
+	/**
 	 * Verify a candidate CSRF token against the session's expected token value using timing-safe `hash_equals()`.
 	 */
 	private function isMatchingCsrfToken(mixed $candidate, string $expectedValue): bool
 	{
-		if (!is_string($candidate) || $candidate === '' || $expectedValue === '') {
+		if (!is_string($candidate) || $expectedValue === '') {
 			return false;
 		}
 
-		if (strlen($candidate) > self::MAX_CSRF_TOKEN_LENGTH || preg_match('/[\x00-\x1F\x7F]/', $candidate) === 1) {
+		$candidate = trim($candidate);
+		if ($candidate === '' || strlen($candidate) > self::MAX_CSRF_TOKEN_LENGTH || preg_match('/[\x00-\x1F\x7F]/', $candidate) === 1) {
 			return false;
 		}
 
 		$decodedCandidate = rawurldecode($candidate);
+		if (preg_match('/[\x00-\x1F\x7F]/', $decodedCandidate) === 1) {
+			return false;
+		}
 
 		return hash_equals($expectedValue, $candidate) || hash_equals($expectedValue, $decodedCandidate);
 	}
@@ -463,9 +717,28 @@ class Request extends Wire
 	 *
 	 * @param array<int, string|int>|string|int|callable|null $valid Sanitizer name(s), allowed values whitelist, integer toggle, or validation callback
 	 */
-	public function get(string $key = '', array|string|int|callable|null $valid = null, mixed $fallback = null): mixed
+	public function get(?string $key = '', array|string|int|callable|null $valid = null, mixed $fallback = null): mixed
 	{
-		return $this->wireInput()->get($key, $valid, $fallback);
+		$normalizedKey = $key ?? '';
+		if ($normalizedKey !== '') {
+			$lookupKey = str_ends_with($normalizedKey, '[]') ? substr($normalizedKey, 0, -2) : $normalizedKey;
+			if (!$this->isSafeInputKey($lookupKey)) {
+				return $fallback;
+			}
+		}
+
+		$input = $this->wireInput();
+		if ($input === null) {
+			return $normalizedKey === '' ? [] : $fallback;
+		}
+
+		try {
+			return $input->get($normalizedKey, $valid, $fallback);
+		} catch (Throwable $e) {
+			$this->logRequestError('get', $e);
+
+			return $fallback;
+		}
 	}
 
 	/**
@@ -474,18 +747,119 @@ class Request extends Wire
 	 *
 	 * @param array<int, string|int>|string|int|callable|null $valid Sanitizer name(s), allowed values whitelist, integer toggle, or validation callback
 	 */
-	public function post(string $key = '', array|string|int|callable|null $valid = null, mixed $fallback = null): mixed
+	public function post(?string $key = '', array|string|int|callable|null $valid = null, mixed $fallback = null): mixed
 	{
-		$input = $this->wireInput();
-		if ($this->isDemoModeBlocked()) {
-			$input->post->removeAll();
-
-			return $key === '' ? $input->post : $fallback;
+		$normalizedKey = $key ?? '';
+		if ($normalizedKey !== '') {
+			$lookupKey = str_ends_with($normalizedKey, '[]') ? substr($normalizedKey, 0, -2) : $normalizedKey;
+			if (!$this->isSafeInputKey($lookupKey)) {
+				return $fallback;
+			}
 		}
 
-		$this->syncJsonToPost();
+		$input = $this->wireInput();
+		if ($input === null) {
+			return $normalizedKey === '' ? [] : $fallback;
+		}
 
-		return $input->post($key, $valid, $fallback);
+		if ($this->isDemoModeBlocked()) {
+			$this->purgeMutatingGlobals();
+
+			return $normalizedKey === '' ? $input->post : $fallback;
+		}
+
+		$syncEnabled = $this->shouldSyncJsonToPost();
+		if ($syncEnabled) {
+			$this->syncJsonToPost();
+		} else {
+			$this->syncCsrfToPost();
+		}
+
+		if (!$syncEnabled && $normalizedKey !== '') {
+			$postArr = $this->postArray();
+			$arrayMode = str_ends_with($normalizedKey, '[]') || is_array($fallback);
+			$cleanKey = str_ends_with($normalizedKey, '[]') ? substr($normalizedKey, 0, -2) : $normalizedKey;
+			if (array_key_exists($cleanKey, $postArr) && $postArr[$cleanKey] !== null) {
+				$rawVal = $postArr[$cleanKey];
+				if ($arrayMode && !is_array($rawVal)) {
+					$rawVal = $rawVal === '' ? [] : [$rawVal];
+				}
+
+				return $valid !== null
+					? $this->applyInputSanitizer($rawVal, $valid, $fallback, $arrayMode)
+					: $rawVal;
+			}
+		}
+
+		try {
+			return $input->post($normalizedKey, $valid, $fallback);
+		} catch (Throwable $e) {
+			$this->logRequestError('post', $e);
+
+			return $fallback;
+		}
+	}
+
+	/**
+	 * Return all GET parameters as a sanitized associative array via `WireInput::$get`.
+	 *
+	 * @return array<string, mixed>
+	 */
+	public function getArray(): array
+	{
+		$input = $this->wireInput();
+		if ($input !== null && is_object($input->get) && method_exists($input->get, 'getArray')) {
+			try {
+				$arr = $input->get->getArray();
+
+				return is_array($arr) ? $this->sanitizeJsonTree($arr) : [];
+			} catch (Throwable $e) {
+				$this->logRequestError('getArray', $e);
+
+				return [];
+			}
+		}
+
+		return [];
+	}
+
+	/**
+	 * Return all POST / JSON parameters as a sanitized associative array via `WireInput::$post`.
+	 * Returns an empty array when a state-mutating request is blocked by ProcessWire demo mode (`$config->demo = true`).
+	 *
+	 * @return array<string, mixed>
+	 */
+	public function postArray(): array
+	{
+		if ($this->isDemoModeBlocked()) {
+			return [];
+		}
+
+		if ($this->shouldSyncJsonToPost()) {
+			$this->syncJsonToPost();
+		} else {
+			$this->syncCsrfToPost();
+		}
+
+		$input = $this->wireInput();
+		$post = [];
+		if ($input !== null && is_object($input->post) && method_exists($input->post, 'getArray')) {
+			try {
+				$arr = $input->post->getArray();
+				$post = is_array($arr) ? $this->sanitizeJsonTree($arr) : [];
+			} catch (Throwable $e) {
+				$this->logRequestError('postArray', $e);
+				$post = [];
+			}
+		}
+
+		if (!$this->shouldSyncJsonToPost()) {
+			$formPayload = $this->isUrlEncodedForm() ? $this->decodeRawFormBody() : [];
+
+			return array_replace($post, $formPayload, $this->json());
+		}
+
+		return $post;
 	}
 
 	/**
@@ -498,15 +872,16 @@ class Request extends Wire
 	public function all(): array
 	{
 		$input = $this->wireInput();
-		$get = $input->get->getArray();
+		$get = $input !== null ? $this->sanitizeJsonTree($input->get->getArray()) : [];
 
 		if ($this->isDemoModeBlocked()) {
 			return $get;
 		}
 
-		$post = $input->post->getArray();
+		$post = $input !== null ? $this->sanitizeJsonTree($input->post->getArray()) : [];
+		$formPayload = $this->isUrlEncodedForm() ? $this->decodeRawFormBody() : [];
 
-		return array_merge($get, $post, $this->json());
+		return array_replace($get, $post, $formPayload, $this->json());
 	}
 
 	/**
@@ -522,17 +897,27 @@ class Request extends Wire
 			return $all;
 		}
 
+		$arrayMode = is_array($default);
+		$lookupKey = $key;
+		if (str_ends_with($lookupKey, '[]')) {
+			$arrayMode = true;
+			$lookupKey = substr($lookupKey, 0, -2);
+		}
+		if ($lookupKey === '') {
+			return $default;
+		}
+
 		$found = false;
 		$value = null;
 
-		if (array_key_exists($key, $all)) {
+		if (array_key_exists($lookupKey, $all)) {
 			$found = true;
-			$value = $all[$key];
-		} elseif (str_contains($key, '.')) {
+			$value = $all[$lookupKey];
+		} elseif (str_contains($lookupKey, '.')) {
 			$cursor = $all;
 			$found = true;
-			foreach (explode('.', $key) as $segment) {
-				if (!is_array($cursor) || !array_key_exists($segment, $cursor)) {
+			foreach (explode('.', $lookupKey) as $segment) {
+				if ($segment === '' || !$this->isSafeInputKey($segment) || !is_array($cursor) || !array_key_exists($segment, $cursor)) {
 					$found = false;
 					break;
 				}
@@ -541,17 +926,23 @@ class Request extends Wire
 			if ($found) {
 				$value = $cursor;
 			}
+		} elseif (!$this->isSafeInputKey($lookupKey)) {
+			return $default;
 		}
 
 		if (!$found || $value === null) {
 			return $default;
 		}
 
+		if ($arrayMode && !is_array($value)) {
+			$value = $value === '' ? [] : [$value];
+		}
+
 		if ($sanitizer === null) {
 			return $value;
 		}
 
-		return $this->applyInputSanitizer($value, $sanitizer, $default);
+		return $this->applyInputSanitizer($value, $sanitizer, $default, $arrayMode);
 	}
 
 	/**
@@ -559,9 +950,9 @@ class Request extends Wire
 	 *
 	 * @param array<int, string|int>|string|int|callable $sanitizer
 	 */
-	private function applyInputSanitizer(mixed $value, array|string|int|callable $sanitizer, mixed $default = null): mixed
+	private function applyInputSanitizer(mixed $value, array|string|int|callable $sanitizer, mixed $default = null, bool $getArray = false): mixed
 	{
-		if (is_callable($sanitizer)) {
+		if (is_callable($sanitizer) && !is_string($sanitizer)) {
 			$result = $sanitizer($value);
 
 			return $result ?? $default;
@@ -576,6 +967,23 @@ class Request extends Wire
 		}
 
 		if (is_array($sanitizer)) {
+			if ($getArray && is_array($value)) {
+				$matched = [];
+				foreach ($value as $item) {
+					if (!is_scalar($item)) {
+						continue;
+					}
+					foreach ($sanitizer as $allowed) {
+						if ((string) $allowed === (string) $item) {
+							$matched[] = $allowed;
+							break;
+						}
+					}
+				}
+
+				return $matched;
+			}
+
 			while (is_array($value)) {
 				$value = $value !== [] ? reset($value) : null;
 			}
@@ -590,7 +998,11 @@ class Request extends Wire
 			return $default;
 		}
 
-		$pwSanitizer = $this->wire()->sanitizer;
+		$pwSanitizer = $this->wire()?->sanitizer;
+		if ($pwSanitizer === null) {
+			return $default;
+		}
+
 		$allSanitizers = $pwSanitizer->getAll(true);
 		$current = $value;
 
@@ -601,29 +1013,75 @@ class Request extends Wire
 			}
 			$returnType = is_array($allSanitizers) ? (string) ($allSanitizers[$methodName] ?? '') : '';
 			if (!str_contains($returnType, 'a')) {
+				if ($getArray && is_array($current)) {
+					$mapped = [];
+					foreach ($current as $k => $item) {
+						while (is_array($item)) {
+							$item = $item !== [] ? reset($item) : '';
+						}
+						try {
+							$sanitizedItem = $pwSanitizer->sanitize($item, $methodName);
+						} catch (Throwable $e) {
+							$this->logRequestError('sanitize', $e);
+
+							return $default;
+						}
+						if ($sanitizedItem !== null) {
+							$mapped[$k] = $sanitizedItem;
+						}
+					}
+					$current = array_values($mapped);
+					continue;
+				}
 				while (is_array($current)) {
 					$current = $current !== [] ? reset($current) : '';
 				}
 			}
-			$current = $pwSanitizer->sanitize($current, $methodName);
+			try {
+				$current = $pwSanitizer->sanitize($current, $methodName);
+			} catch (Throwable $e) {
+				$this->logRequestError('sanitize', $e);
+
+				return $default;
+			}
+			if ($current === null) {
+				return $default;
+			}
 		}
 
 		return $current ?? $default;
 	}
 
 	/**
-	 * Resolve the current pagination page number (>= 1) from `$pageName` input or ProcessWire's `$input->pageNum()`.
+	 * Resolve the current pagination page number (`1..maxPageNum`) from `$pageName` input or ProcessWire's `$input->pageNum()`.
 	 */
 	public function pageNumber(string $pageName = 'page'): int
 	{
+		$maxPageNum = max(1, (int) ($this->wire()?->config?->maxPageNum ?: 999));
 		$val = $this->input($pageName);
-		if (is_numeric($val) && (int) $val >= 1) {
-			return (int) $val;
+		if (is_int($val)) {
+			return $val >= 1 ? min($val, $maxPageNum) : 1;
+		}
+		if (is_string($val)) {
+			$trimmed = trim($val);
+			if ($trimmed !== '') {
+				if (ctype_digit($trimmed)) {
+					$parsed = (int) (strlen($trimmed) > 9 ? $maxPageNum : $trimmed);
+
+					return $parsed >= 1 ? min($parsed, $maxPageNum) : 1;
+				}
+				if ($trimmed[0] === '-' && strlen($trimmed) > 1 && ctype_digit(substr($trimmed, 1))) {
+					return 1;
+				}
+			}
 		}
 
-		$pageNum = (int) $this->wireInput()->pageNum();
-		if ($pageNum >= 1) {
-			return $pageNum;
+		$input = $this->wireInput();
+		if ($input !== null && method_exists($input, 'pageNum')) {
+			$pageNum = (int) $input->pageNum();
+			if ($pageNum >= 1) {
+				return min($pageNum, $maxPageNum);
+			}
 		}
 
 		return 1;
@@ -644,19 +1102,34 @@ class Request extends Wire
 			return false;
 		}
 
-		if (!$this->wire()->config->protectCSRF) {
-			return true;
-		}
+		if (!$this->isMutatingMethod()) {
+			if ($throwException) {
+				throw new WirePermissionException($this->_('Request security validation failed. Please refresh the page and try again.'));
+			}
 
-		$this->syncJsonToPost();
-		$this->syncCsrfToPost(true);
-
-		$session = $this->wire()->session;
-		if ($session === null) {
 			return false;
 		}
 
-		$csrf = $session->CSRF;
+		$config = $this->wire()?->config;
+		if ($config !== null && isset($config->protectCSRF) && !(bool) $config->protectCSRF) {
+			return true;
+		}
+
+		if ($this->shouldSyncJsonToPost()) {
+			$this->syncJsonToPost();
+		}
+		$this->syncCsrfToPost(true);
+
+		$session = $this->wire()?->session;
+		$csrf = $session !== null ? $session->CSRF : null;
+		if (!is_object($csrf) || !method_exists($csrf, 'hasValidToken')) {
+			if ($throwException) {
+				throw new WirePermissionException($this->_('Request security validation failed. Please refresh the page and try again.'));
+			}
+
+			return false;
+		}
+
 		$valid = (bool) $csrf->hasValidToken('', false);
 
 		if (!$valid) {
@@ -670,9 +1143,60 @@ class Request extends Wire
 	}
 
 	/**
+	 * Determine whether an inbound HTTP header was explicitly sent on the request (even if its value is empty).
+	 */
+	public function hasHeader(string $name): bool
+	{
+		$canonical = $name;
+		if (str_starts_with(strtoupper($name), 'HTTP_')) {
+			$canonical = str_replace('_', '-', substr($name, 5));
+		}
+
+		foreach ($this->headerOverrides as $k => $_v) {
+			if (strcasecmp($k, $canonical) === 0 || strcasecmp($k, $name) === 0) {
+				return true;
+			}
+		}
+
+		$input = $this->wireInput();
+		if ($input !== null && method_exists($input, 'getHeader')) {
+			try {
+				if ($input->getHeader($canonical) !== null || $input->getHeader($name) !== null) {
+					return true;
+				}
+			} catch (Throwable $e) {
+				$this->logRequestError('hasHeader', $e);
+			}
+		}
+
+		if (function_exists('getallheaders')) {
+			$headers = @getallheaders();
+			if (is_array($headers)) {
+				foreach ($headers as $k => $_v) {
+					if (is_string($k) && (strcasecmp($k, $canonical) === 0 || strcasecmp($k, $name) === 0)) {
+						return true;
+					}
+				}
+			}
+		}
+
+		$upperSnake = strtoupper(str_replace('-', '_', $canonical));
+		$serverKeys = ($upperSnake === 'CONTENT_TYPE' || $upperSnake === 'CONTENT_LENGTH')
+			? [$upperSnake, 'HTTP_' . $upperSnake]
+			: ['HTTP_' . $upperSnake];
+		foreach ($serverKeys as $serverKey) {
+			if (array_key_exists($serverKey, $_SERVER)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
 	 * Read an inbound HTTP header by canonical name (e.g. `X-Inertia`) or CGI name (`HTTP_X_INERTIA`).
 	 */
-	public function header(string $name): ?string
+	public function header(string $name, ?string $default = null): ?string
 	{
 		$canonical = $name;
 		if (str_starts_with(strtoupper($name), 'HTTP_')) {
@@ -681,7 +1205,25 @@ class Request extends Wire
 
 		foreach ($this->headerOverrides as $k => $v) {
 			if (strcasecmp($k, $canonical) === 0 || strcasecmp($k, $name) === 0) {
-				return $v !== '' ? $v : null;
+				return $v !== '' ? $v : $default;
+			}
+		}
+
+		$input = $this->wireInput();
+		if ($input !== null && method_exists($input, 'getHeader')) {
+			try {
+				$value = $input->getHeader($canonical);
+				if ($value !== null && trim((string) $value) !== '') {
+					return trim((string) $value);
+				}
+				if ($canonical !== $name) {
+					$rawVal = $input->getHeader($name);
+					if ($rawVal !== null && trim((string) $rawVal) !== '') {
+						return trim((string) $rawVal);
+					}
+				}
+			} catch (Throwable $e) {
+				$this->logRequestError('header', $e);
 			}
 		}
 
@@ -692,27 +1234,29 @@ class Request extends Wire
 					if (is_string($k) && (strcasecmp($k, $canonical) === 0 || strcasecmp($k, $name) === 0) && is_scalar($v)) {
 						$str = trim((string) $v);
 
-						return $str !== '' ? $str : null;
+						return $str !== '' ? $str : $default;
 					}
 				}
 			}
 		}
 
 		$upperSnake = strtoupper(str_replace('-', '_', $canonical));
-		$serverKeys = [
-			'HTTP_' . $upperSnake,
-			$upperSnake,
-			$name,
-		];
-		foreach ($serverKeys as $serverKey) {
+		$serverKeys = ($upperSnake === 'CONTENT_TYPE' || $upperSnake === 'CONTENT_LENGTH')
+			? [$upperSnake, 'HTTP_' . $upperSnake]
+			: ['HTTP_' . $upperSnake];
+		$upperName = strtoupper($name);
+		if (str_starts_with($upperName, 'HTTP_') || $upperName === 'CONTENT_TYPE' || $upperName === 'CONTENT_LENGTH') {
+			$serverKeys[] = $upperName;
+		}
+		foreach (array_unique($serverKeys) as $serverKey) {
 			if (isset($_SERVER[$serverKey]) && is_scalar($_SERVER[$serverKey])) {
 				$str = trim((string) $_SERVER[$serverKey]);
 
-				return $str !== '' ? $str : null;
+				return $str !== '' ? $str : $default;
 			}
 		}
 
-		return null;
+		return $default;
 	}
 
 	/**
@@ -735,6 +1279,7 @@ class Request extends Wire
 			'X-Inertia-Infinite-Scroll-Merge-Intent' => 'infinite-scroll-merge-intent',
 			'X-Inertia-Error-Bag' => 'error-bag',
 			'Purpose' => 'purpose',
+			'Sec-Purpose' => 'sec-purpose',
 		];
 
 		foreach ($keys as $headerName => $shortKey) {
@@ -758,7 +1303,10 @@ class Request extends Wire
 		$this->methodOverride = $method;
 		$this->rawBodyOverride = $rawJsonBody;
 		$this->jsonBody = null;
+		$this->formBody = null;
+		$this->preDemoMethod = null;
 		$this->demoBlocked = false;
+		unset($_SERVER['PW_DEMO_ORIGINAL_METHOD']);
 
 		return $this;
 	}
@@ -772,7 +1320,10 @@ class Request extends Wire
 		$this->methodOverride = null;
 		$this->rawBodyOverride = null;
 		$this->jsonBody = null;
+		$this->formBody = null;
+		$this->preDemoMethod = null;
 		$this->demoBlocked = false;
+		unset($_SERVER['PW_DEMO_ORIGINAL_METHOD']);
 
 		return $this;
 	}
@@ -796,5 +1347,14 @@ class Request extends Wire
 		}
 
 		return array_values(array_unique($cleaned));
+	}
+
+	private function logRequestError(string $context, Throwable $e): void
+	{
+		try {
+			$this->wire()?->log?->error("Inertia Request {$context} failed: " . $e->getMessage());
+		} catch (Throwable) {
+			// Guard against recursive logging errors when filesystem log is unwritable
+		}
 	}
 }

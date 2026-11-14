@@ -201,7 +201,11 @@ final class ScrollProp implements PropInterface
 			return ($this->value)();
 		}
 
-		$input = $request->wire()->input;
+		$input = $request->wireInput();
+		if ($input === null) {
+			return ($this->value)();
+		}
+
 		$previousPageNum = (int) $input->pageNum();
 		$input->setPageNum($requestedPage);
 
