@@ -24,8 +24,10 @@ use Totoglu\Inertia\Request;
 use Totoglu\Inertia\Response;
 use Totoglu\Inertia\Ssr\HttpGateway;
 use Totoglu\Inertia\Ssr\SsrResponse;
+use Totoglu\Inertia\Support\AdminProcessExecutor;
 use Totoglu\Inertia\Support\ErrorBag;
 use Totoglu\Inertia\Support\PropResolver;
+use Totoglu\Inertia\Support\RootViewRenderer;
 use Totoglu\Inertia\Support\TemplateMode;
 use Totoglu\Inertia\Support\TypeGenerator;
 use Throwable;
@@ -59,6 +61,7 @@ use UnitEnum;
  * @method void registerProviders()
  * @method array<string, mixed> buildPageObject(PageResponse $pageResponse)
  * @method string renderPageResponse(PageResponse $pageResponse)
+ * @method void uninstall()
  */
 class Inertia extends WireData implements Module, ConfigurableModule
 {
@@ -66,6 +69,14 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	public const string SESSION_CLEAR_HISTORY_KEY = 'clear_history';
 	public const string SESSION_PRESERVE_FRAGMENT_KEY = 'preserve_fragment';
 	public const string SESSION_FLASH_KEY = 'flash';
+
+	public const int JSON_HTML_SAFE_FLAGS = JSON_UNESCAPED_SLASHES
+		| JSON_UNESCAPED_UNICODE
+		| JSON_HEX_TAG
+		| JSON_HEX_AMP
+		| JSON_HEX_APOS
+		| JSON_HEX_QUOT
+		| JSON_INVALID_UTF8_SUBSTITUTE;
 
 	public Request $request;
 
@@ -83,6 +94,10 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	private array $earlyProviders = [];
 
 	protected SsrGatewayInterface $ssrGateway;
+
+	private RootViewRenderer $rootViewRenderer;
+
+	private AdminProcessExecutor $adminProcessExecutor;
 
 	/** @var array<string, mixed> Shared props registered across the request */
 	protected array $sharedProps = [];
@@ -119,6 +134,10 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	private bool $withoutSsrGlobal = false;
 
 	private bool $demoWarningEmitted = false;
+
+	private bool $initHooksRegistered = false;
+
+	private bool $readyHooksRegistered = false;
 
 	/** @var array<string, mixed>|null Last applied `setting('inertia')` array so fluent runtime overrides are preserved */
 	private ?array $lastAppliedGlobalSettings = null;
@@ -170,6 +189,8 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		$this->providers = new ProviderRegistry();
 		$this->resolver = new PropResolver($this->providers);
 		$this->ssrGateway = new HttpGateway();
+		$this->rootViewRenderer = new RootViewRenderer($this, __DIR__ . '/commands/stubs/templates');
+		$this->adminProcessExecutor = new AdminProcessExecutor($this);
 
 		$this->applyConfigMap($this->getDefaultConfig());
 	}
@@ -267,10 +288,32 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		$this->wire($this->errors);
 		$this->wire($this->providers);
 		$this->wire($this->resolver);
+		$this->wire($this->rootViewRenderer);
+		$this->wire($this->adminProcessExecutor);
 		if ($this->ssrGateway instanceof Wire) {
 			$this->wire($this->ssrGateway);
 		}
 		$this->wire('inertia', $this);
+	}
+
+	/**
+	 * Purge Inertia's `WireCache` (`inertia-once`) and `Session` (`inertia`) namespaces on module uninstall.
+	 */
+	public function ___uninstall(): void
+	{
+		$wire = $this->wire();
+
+		try {
+			$wire->cache?->deleteFor(PropResolver::ONCE_CACHE_NAMESPACE);
+		} catch (Throwable $e) {
+			$wire->log?->error('Inertia uninstall cache cleanup failed: ' . $e->getMessage());
+		}
+
+		try {
+			$wire->session?->removeAllFor(self::SESSION_NAMESPACE);
+		} catch (Throwable $e) {
+			$wire->log?->error('Inertia uninstall session cleanup failed: ' . $e->getMessage());
+		}
 	}
 
 	/**
@@ -333,17 +376,31 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		$config = $wire->config;
 		$config->inertia = $this->request->isInertia();
 
-		if ($this->syncJsonToPost) {
-			$this->request->syncJsonToPost();
+		if ($this->request->isInertia()) {
+			if (!$this->inAdmin()) {
+				$this->enforceDemoModeGuard();
+			}
+			if ($this->syncJsonToPost) {
+				$this->request->syncJsonToPost();
+			} else {
+				$this->request->syncCsrfToPost();
+			}
 		}
 
-		$wire->addHookAfter('Modules::saveConfig', $this, 'hookAfterSaveModuleConfig');
-		$wire->addHookAfter('Pages::saved', $this, 'hookAfterPageSavedOrDeleted');
-		$wire->addHookAfter('Pages::deleted', $this, 'hookAfterPageSavedOrDeleted');
-		$wire->addHookAfter('Pages::trashed', $this, 'hookAfterPageSavedOrDeleted');
-		if ((bool) $config->debug && (bool) $this->autoGenerateTypes) {
-			$wire->addHookAfter('Templates::saved', $this, 'hookAfterSchemaSaved');
-			$wire->addHookAfter('Fields::saved', $this, 'hookAfterSchemaSaved');
+		if (!$this->initHooksRegistered) {
+			$this->initHooksRegistered = true;
+			$wire->addHookBefore('Session::redirect', $this, 'hookSessionRedirect');
+			$wire->addHookAfter('Session::logout', $this, 'hookSessionLogout');
+			$wire->addHookAfter('Session::loginSuccess', $this, 'hookSessionLoginSuccess');
+			$wire->addHookBefore('Modules::saveConfig', $this, 'hookBeforeSaveModuleConfig');
+			$wire->addHookAfter('Modules::saveConfig', $this, 'hookAfterSaveModuleConfig');
+			$wire->addHookAfter('Pages::saved', $this, 'hookAfterPageSavedOrDeleted');
+			$wire->addHookAfter('Pages::deleted', $this, 'hookAfterPageSavedOrDeleted');
+			$wire->addHookAfter('Pages::trashed', $this, 'hookAfterPageSavedOrDeleted');
+			if ((bool) $config->debug && (bool) $this->autoGenerateTypes) {
+				$wire->addHookAfter('Templates::saved', $this, 'hookAfterSchemaSaved');
+				$wire->addHookAfter('Fields::saved', $this, 'hookAfterSchemaSaved');
+			}
 		}
 	}
 
@@ -359,10 +416,16 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			return;
 		}
 
-		if ($this->syncJsonToPost) {
-			$this->request->syncJsonToPost();
-		} else {
-			$this->request->syncCsrfToPost();
+		$isRelevantInertiaRequest = $this->request->isInertia()
+			|| ($page instanceof Page && ($this->shouldHandlePage($page) || $this->shouldHandleAdminPage($page)));
+
+		if ($isRelevantInertiaRequest) {
+			$this->enforceDemoModeGuard();
+			if ($this->syncJsonToPost) {
+				$this->request->syncJsonToPost();
+			} else {
+				$this->request->syncCsrfToPost();
+			}
 		}
 
 		if ($this->autoShareCsrf) {
@@ -374,20 +437,18 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		}
 
 		// Configure native ProcessWire template append/prepend settings for the resolved $page
-		if ($page instanceof Page && ($this->shouldHandlePage($page) || $this->shouldHandleAdminPage($page))) {
-			if ($this->shouldHandlePage($page)) {
-				$this->configurePageTemplateFiles($page);
-			}
-			$this->enforceDemoModeGuard();
+		if ($page instanceof Page && $this->shouldHandlePage($page)) {
+			$this->configurePageTemplateFiles($page);
 		}
 
-		// Register lifecycle hooks
-		$wire->addHookBefore('Session::redirect', $this, 'hookSessionRedirect');
-		$wire->addHookAfter('Session::logout', $this, 'hookSessionLogout');
-		$wire->addHookBefore('Page::render', $this, 'hookBeforePageRender', ['priority' => 1]);
-		$wire->addHookBefore('TemplateFile::render', $this, 'hookBeforeTemplateFileRender');
-		$wire->addHookAfter('TemplateFile::render', $this, 'hookAfterTemplateFileRender');
-		$wire->addHookAfter('Page::render', $this, 'hookAfterPageRender', ['priority' => 99]);
+		// Register page & template render hooks
+		if (!$this->readyHooksRegistered) {
+			$this->readyHooksRegistered = true;
+			$wire->addHookBefore('Page::render', $this, 'hookBeforePageRender', ['priority' => 1]);
+			$wire->addHookBefore('TemplateFile::render', $this, 'hookBeforeTemplateFileRender');
+			$wire->addHookAfter('TemplateFile::render', $this, 'hookAfterTemplateFileRender');
+			$wire->addHookAfter('Page::render', $this, 'hookAfterPageRender', ['priority' => 99]);
+		}
 	}
 
 	/**
@@ -424,6 +485,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		$page = $this->wire()->page;
 		if ($page instanceof Page && $page->id > 0 && $this->shouldHandlePage($page)) {
 			$this->configurePageTemplateFiles($page);
+			$this->enforceDemoModeGuard();
 		}
 	}
 
@@ -654,14 +716,6 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		return $this;
 	}
 
-	/**
-	 * @param string|array<string, mixed> $key
-	 */
-	public function shared(string|array $key, mixed $value = null): self
-	{
-		return $this->share($key, $value);
-	}
-
 	public function getShared(?string $key = null, mixed $default = null): mixed
 	{
 		if ($key === null) {
@@ -688,14 +742,6 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		$this->sharedViewData = array_merge($this->sharedViewData, is_array($key) ? $key : [$key => $value]);
 
 		return $this;
-	}
-
-	/**
-	 * @param string|array<string, mixed> $key
-	 */
-	public function withViewData(string|array $key, mixed $value = null): self
-	{
-		return $this->viewData($key, $value);
 	}
 
 	public function getViewData(?string $key = null, mixed $default = null): mixed
@@ -926,8 +972,11 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	 */
 	public function redirect(string $url, bool $terminate = false): Response
 	{
+		$rootFallback = (string) ($this->wire()->config->urls->get('root') ?: '/');
+		$safeTarget = $this->isSafeBackTarget($url) ? $url : $rootFallback;
+
 		if ($this->request->isInertia()) {
-			$this->response->conflictRedirect($url);
+			$this->response->conflictRedirect($safeTarget);
 			if ($terminate) {
 				exit;
 			}
@@ -935,7 +984,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			return $this->response;
 		}
 
-		return $this->prepareSeeOtherRedirect($url, $terminate);
+		return $this->prepareSeeOtherRedirect($safeTarget, $terminate);
 	}
 
 	/**
@@ -944,8 +993,10 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	 */
 	public function location(string $url, bool $terminate = false): Response
 	{
+		$safeUrl = $this->response->sanitizeNavigationUrl($url);
+
 		if ($this->request->isInertia()) {
-			$this->response->conflictLocation($url);
+			$this->response->conflictLocation($safeUrl);
 			if ($terminate) {
 				exit;
 			}
@@ -954,10 +1005,10 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		}
 
 		if ($terminate) {
-			$this->wire()->session->redirect($url, false);
+			$this->wire()->session->redirect($safeUrl, false);
 		}
 
-		$this->response->setStatusCode(302)->setHeader('Location', $url);
+		$this->response->setStatusCode(302)->setHeader('Location', $safeUrl);
 
 		return $this->response;
 	}
@@ -968,19 +1019,22 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	 */
 	public function back(string $fallbackUrl = '/', bool $terminate = false): Response
 	{
+		$rootFallback = (string) ($this->wire()->config->urls->get('root') ?: '/');
+		$safeFallback = $this->isSafeBackTarget($fallbackUrl) ? $fallbackUrl : $rootFallback;
 		$referer = trim((string) ($this->request->header('Referer') ?? ''));
-		$target = ($referer !== '' && $this->isSafeBackTarget($referer)) ? $referer : $fallbackUrl;
+		$target = ($referer !== '' && $this->isSafeBackTarget($referer)) ? $referer : $safeFallback;
 
 		return $this->prepareSeeOtherRedirect($target, $terminate);
 	}
 
 	private function prepareSeeOtherRedirect(string $url, bool $terminate): Response
 	{
-		$this->response->setStatusCode(303)->setHeader('Location', $url);
+		$safeUrl = $this->response->sanitizeNavigationUrl($url);
+		$this->response->setStatusCode(303)->setHeader('Location', $safeUrl);
 
 		if ($terminate) {
 			$this->forceNextRedirect303 = true;
-			$this->wire()->session->redirect($url, 303);
+			$this->wire()->session->redirect($safeUrl, 303);
 		}
 
 		return $this->response;
@@ -991,16 +1045,29 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	 */
 	protected function isSafeBackTarget(string $url): bool
 	{
-		if ($url === '' || preg_match('/[\x00-\x20]/', $url) === 1) {
+		if ($url === '' || preg_match('/[\x00-\x20\x7F]/', $url) === 1 || str_contains($url, '\\')) {
 			return false;
 		}
 
-		if (str_starts_with($url, '/') && !str_starts_with($url, '//') && !str_starts_with($url, '/\\')) {
+		$config = $this->wire()->config;
+		$rootUrl = (string) ($config->urls->get('root') ?: '/');
+		$rootPrefix = $rootUrl !== '' ? '/' . trim($rootUrl, '/') . '/' : '/';
+		if ($rootPrefix === '//') {
+			$rootPrefix = '/';
+		}
+
+		if (str_starts_with($url, '/') && !str_starts_with($url, '//')) {
+			if ($rootPrefix !== '/') {
+				$relPath = (string) (parse_url($url, PHP_URL_PATH) ?? '/');
+				$trimmedRoot = rtrim($rootPrefix, '/');
+				return $relPath === $trimmedRoot || str_starts_with($relPath, $rootPrefix);
+			}
+
 			return true;
 		}
 
 		$parts = parse_url($url);
-		if (!is_array($parts)) {
+		if (!is_array($parts) || isset($parts['user']) || isset($parts['pass'])) {
 			return false;
 		}
 
@@ -1014,11 +1081,22 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			return false;
 		}
 
+		if (str_contains($host, ':') && !str_starts_with($host, '[')) {
+			$host = '[' . $host . ']';
+		}
+
 		$port = isset($parts['port']) ? ':' . (int) $parts['port'] : '';
 		$hostWithPort = $host . $port;
 
-		$config = $this->wire()->config;
-		$allowedHosts = ['localhost', '127.0.0.1'];
+		if ($rootPrefix !== '/') {
+			$absPath = (string) ($parts['path'] ?? '/');
+			$trimmedRoot = rtrim($rootPrefix, '/');
+			if ($absPath !== $trimmedRoot && !str_starts_with($absPath, $rootPrefix)) {
+				return false;
+			}
+		}
+
+		$allowedHosts = [];
 		$candidateHosts = [$config->httpHost];
 		if (is_iterable($config->httpHosts)) {
 			foreach ($config->httpHosts as $configuredHost) {
@@ -1026,25 +1104,19 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			}
 		}
 
-		$hasConfiguredHosts = false;
 		foreach ($candidateHosts as $candidateHost) {
 			$clean = strtolower(trim((string) $candidateHost));
 			if ($clean !== '') {
-				$hasConfiguredHosts = true;
 				$allowedHosts[] = $clean;
-				$allowedHosts[] = (string) explode(':', $clean)[0];
 			}
 		}
 
-		if (!$hasConfiguredHosts) {
-			$serverHost = strtolower(trim((string) ($this->request->header('Host') ?? '')));
-			if ($serverHost !== '') {
-				$allowedHosts[] = $serverHost;
-				$allowedHosts[] = (string) explode(':', $serverHost)[0];
-			}
+		if ($allowedHosts === []) {
+			$allowedHosts = ['localhost', '127.0.0.1', '[::1]'];
 		}
 
-		return in_array($host, $allowedHosts, true) || in_array($hostWithPort, $allowedHosts, true);
+		return in_array($hostWithPort, $allowedHosts, true)
+			|| ($port === '' && in_array($host, $allowedHosts, true));
 	}
 
 	/**
@@ -1091,7 +1163,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			: ($configuredId !== '' ? $configuredId : 'app');
 
 		$sanitizer = $this->wire()->sanitizer;
-		$json = json_encode($pageObject, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG);
+		$json = json_encode($pageObject, self::JSON_HTML_SAFE_FLAGS);
 		$safeJson = is_string($json) ? $json : '{}';
 		$safeId = $sanitizer->entities($rootId);
 		$scriptTag = sprintf(
@@ -1102,11 +1174,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 
 		$ssr = $this->resolveSsrForPageObject($pageObject, $pageResponse);
 		if ($ssr !== null && $ssr->body !== '') {
-			if (str_contains($ssr->body, 'type="application/json"') && str_contains($ssr->body, 'data-page=')) {
-				return $ssr->body;
-			}
-
-			return $ssr->body . "\n\t" . $scriptTag;
+			return $this->replaceSsrDataPageScript($ssr->body, $scriptTag);
 		}
 
 		$extraAttrs = '';
@@ -1134,6 +1202,43 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			$extraAttrs,
 			$scriptTag
 		);
+	}
+
+	/**
+	 * Replace an SSR server's `<script type="application/json" data-page="...">` hydration tag
+	 * with a `JSON_HEX_TAG`-hardened script block, using `json_validate()` boundary detection
+	 * so unescaped `</script>` sequences inside raw SSR JSON cannot break out into live HTML.
+	 */
+	protected function replaceSsrDataPageScript(string $ssrBody, string $scriptTag): string
+	{
+		$openPattern = '/<script\b(?=[^>]*\btype=(["\'])application\/json\1)(?=[^>]*\bdata-page=(["\'])[^"\']*\2)[^>]*>/i';
+		if (preg_match($openPattern, $ssrBody, $match, PREG_OFFSET_CAPTURE) !== 1) {
+			return $ssrBody . "\n\t" . $scriptTag;
+		}
+
+		$tagStart = $match[0][1];
+		$contentStart = $tagStart + strlen($match[0][0]);
+		$searchPos = $contentStart;
+		$lastCloseEnd = null;
+		$matchedCloseEnd = null;
+
+		while (($closePos = stripos($ssrBody, '</script>', $searchPos)) !== false) {
+			$closeEnd = $closePos + 9;
+			$lastCloseEnd = $closeEnd;
+			$candidateJson = trim(substr($ssrBody, $contentStart, $closePos - $contentStart));
+			if ($candidateJson === '' || json_validate($candidateJson, 512, JSON_INVALID_UTF8_IGNORE)) {
+				$matchedCloseEnd = $closeEnd;
+				break;
+			}
+			$searchPos = $closeEnd;
+		}
+
+		$endPos = $matchedCloseEnd ?? $lastCloseEnd;
+		if ($endPos === null) {
+			return substr($ssrBody, 0, $tagStart) . $scriptTag;
+		}
+
+		return substr($ssrBody, 0, $tagStart) . $scriptTag . substr($ssrBody, $endPos);
 	}
 
 	/**
@@ -1192,7 +1297,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		$baselineProps = [
 			'errors' => $this->always(fn(): object|array => $isPrefetch
 				? (object) []
-				: $this->errors->resolve($this->request->errorBag())),
+				: $this->errors->resolve($this->request->isInertia() ? $this->request->errorBag() : null)),
 		];
 
 		if ($this->autoShareFlash) {
@@ -1241,7 +1346,10 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			$pageResponse->rawProps()
 		);
 
-		$resolvedPayload = $this->resolver->resolve($component, $mergedInputProps, $this->request);
+		$sessionClearHistory = $isPrefetch ? false : $this->consumeSessionFlag(self::SESSION_CLEAR_HISTORY_KEY);
+		$clearHistory = (bool) ($pageResponse->getClearHistoryOverride() ?? $sessionClearHistory);
+
+		$resolvedPayload = $this->resolver->resolve($component, $mergedInputProps, $this->request, $clearHistory);
 
 		if (isset($resolvedPayload['componentViewData']) && is_array($resolvedPayload['componentViewData']) && $resolvedPayload['componentViewData'] !== []) {
 			$pageResponse->withViewData($resolvedPayload['componentViewData']);
@@ -1259,9 +1367,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		];
 
 		$topLevelFlash = $this->buildTopLevelFlash($noticesFlash, $customFlash);
-		if ($topLevelFlash !== []) {
-			$pageObject['flash'] = $topLevelFlash;
-		}
+		$pageObject['flash'] = (object) $topLevelFlash;
 
 		$sharedTopKeys = $this->resolveSharedTopKeys($baselineProps, $effectiveSharedProps, $resolvedPayload['props']);
 		if ($sharedTopKeys !== []) {
@@ -1274,13 +1380,14 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			}
 		}
 
-		$encryptHistory = $pageResponse->getEncryptHistoryOverride() ?? (bool) $this->encryptHistory;
+		$encryptOverride = $pageResponse->getEncryptHistoryOverride();
+		$encryptHistory = $encryptOverride ?? (bool) $this->encryptHistory;
 		if ($encryptHistory) {
 			$pageObject['encryptHistory'] = true;
+		} elseif ($encryptOverride === false) {
+			$pageObject['encryptHistory'] = false;
 		}
 
-		$sessionClearHistory = $isPrefetch ? false : $this->consumeSessionFlag(self::SESSION_CLEAR_HISTORY_KEY);
-		$clearHistory = $pageResponse->getClearHistoryOverride() ?? $sessionClearHistory;
 		if ($clearHistory) {
 			$pageObject['clearHistory'] = true;
 		}
@@ -1301,20 +1408,31 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	 * or `InputfieldWrapper` objects passed in `PageResponse` props.
 	 *
 	 * @param array<int|string, mixed> $items
+	 * @param array<int, true> $seen
 	 * @return array<string, mixed>
 	 */
-	private function collectNestedInertiaShared(array $items): array
+	private function collectNestedInertiaShared(array $items, array &$seen = [], int $depth = 0): array
 	{
+		if ($depth >= 64) {
+			return [];
+		}
+
 		$shared = [];
 		foreach ($items as $item) {
 			if (is_array($item)) {
-				$shared = array_merge($shared, $this->collectNestedInertiaShared($item));
+				$shared = array_merge($shared, $this->collectNestedInertiaShared($item, $seen, $depth + 1));
 				continue;
 			}
 
 			if (!is_object($item)) {
 				continue;
 			}
+
+			$objId = spl_object_id($item);
+			if (isset($seen[$objId])) {
+				continue;
+			}
+			$seen[$objId] = true;
 
 			if (method_exists($item, 'inertiaShared')) {
 				$objShared = $item->inertiaShared();
@@ -1329,7 +1447,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 					$children[] = $child;
 				}
 				if ($children !== []) {
-					$shared = array_merge($shared, $this->collectNestedInertiaShared($children));
+					$shared = array_merge($shared, $this->collectNestedInertiaShared($children, $seen, $depth + 1));
 				}
 			}
 		}
@@ -1361,8 +1479,42 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			$this->emitXsrfCookie();
 		}
 
+		$hasTopLevelFlash = ((array) ($pageObject['flash'] ?? [])) !== [];
+		if ($this->response->getHeader('Cache-Control') === null) {
+			if ((bool) ($pageObject['encryptHistory'] ?? false)) {
+				$this->response->setHeader('Cache-Control', 'no-store, private');
+			} elseif ($this->request->isPrefetch()) {
+				if (
+					(bool) $this->autoShareCsrf
+					|| (bool) $this->wire()->user?->isLoggedin()
+					|| $hasTopLevelFlash
+				) {
+					$this->response->setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
+				}
+			} elseif (
+				(bool) $this->autoShareCsrf
+				|| (bool) $this->wire()->user?->isLoggedin()
+				|| $this->request->isPartial()
+				|| $this->request->exceptOnceProps() !== []
+				|| $this->request->resetProps() !== []
+				|| (bool) ($pageObject['clearHistory'] ?? false)
+				|| $hasTopLevelFlash
+			) {
+				$this->response->setHeader('Cache-Control', 'no-cache, private');
+			}
+		}
+
 		if ($this->request->isInertia()) {
 			$this->response->markAsInertiaJson();
+			if ($this->request->isPrefetch()) {
+				$this->response->vary('Purpose, Sec-Purpose');
+			}
+			if ($this->request->isPartial()) {
+				$this->response->vary('X-Inertia-Partial-Component, X-Inertia-Partial-Data, X-Inertia-Partial-Except');
+			}
+			if ($this->request->exceptOnceProps() !== []) {
+				$this->response->vary('X-Inertia-Except-Once-Props');
+			}
 			$this->response->applyHeaders();
 			$json = $pageResponse->toJson();
 			$this->renderedPageResponse = $pageResponse;
@@ -1372,7 +1524,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		}
 
 		// Initial full-page load: render Root View (`_inertia.php`)
-		$this->response->setHeader('Vary', 'X-Inertia');
+		$this->response->vary('X-Inertia');
 		$this->response->applyHeaders();
 
 		$html = $this->renderRootView($pageResponse, $pageObject);
@@ -1405,7 +1557,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	 */
 	protected function checkVersionConflict(): bool
 	{
-		if (!$this->request->isInertia() || $this->request->method() !== 'GET') {
+		if (!$this->request->isInertia() || $this->request->rawMethod() !== 'GET') {
 			return false;
 		}
 
@@ -1413,10 +1565,23 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			return true;
 		}
 
-		$clientVersion = $this->request->version();
 		$serverVersion = $this->getVersion();
+		if ($serverVersion === '') {
+			return false;
+		}
 
-		if ($clientVersion !== null && $serverVersion !== '' && !hash_equals($serverVersion, $clientVersion)) {
+		$clientVersion = $this->request->version();
+		if ($clientVersion === null) {
+			if ($this->request->hasHeader('X-Inertia-Version')) {
+				$this->response->conflictLocation($this->resolveCurrentUrl());
+
+				return true;
+			}
+
+			return false;
+		}
+
+		if (!hash_equals($serverVersion, $clientVersion)) {
 			$this->response->conflictLocation($this->resolveCurrentUrl());
 
 			return true;
@@ -1431,6 +1596,12 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	 */
 	protected function hookBeforePageRender(HookEvent $event): void
 	{
+		$wire = $event->wire() ?? $this->wire();
+		$arg0 = $event->arguments(0);
+		if (is_string($arg0) && $arg0 !== '' && $wire->sanitizer->fieldName($arg0) === $arg0) {
+			return;
+		}
+
 		$this->applyGlobalSettingOverrides();
 
 		$page = $event->object;
@@ -1446,14 +1617,20 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		}
 
 		if ($page->template instanceof Template && $page->template->name === 'admin' && $this->request->isInertia()) {
-			$targetUrl = (string) $this->wire()->input->url(true);
+			$targetUrl = (string) $wire->input->url(true);
 			$this->location($targetUrl !== '' ? $targetUrl : $page->url);
+			$this->response->applyHeaders();
+			$event->replace = true;
+			$event->return = '';
 
 			return;
 		}
 
 		if ($this->shouldHandlePage($page)) {
 			$this->configurePageTemplateFiles($page);
+			$this->enforceDemoModeGuard();
+			$this->disablePageRenderCache($event);
+		} elseif ($this->request->isInertia()) {
 			$this->enforceDemoModeGuard();
 			$this->disablePageRenderCache($event);
 		}
@@ -1475,141 +1652,67 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	}
 
 	/**
+	 * Evict any `PageRender` disk cache file created during an unconfigured Hybrid `$inertia->render()` call
+	 * so per-session CSRF/flash props in `_inertia.php` are never persisted to shared disk cache.
+	 */
+	private function evictPageRenderCacheIfCreated(Page $page, HookEvent $event): void
+	{
+		if ((int) ($page->template?->cache_time ?? 0) <= 0) {
+			return;
+		}
+
+		$arg0 = $event->arguments(0);
+		$options = is_array($arg0) ? $arg0 : [];
+		if (($options['allowCache'] ?? null) === false) {
+			return;
+		}
+
+		$wire = $event->wire() ?? $this->wire();
+		try {
+			$modules = $wire->modules;
+			if ($modules === null || !$modules->isInstalled('PageRender')) {
+				return;
+			}
+			$pageRender = $modules->get('PageRender');
+			if (is_object($pageRender) && method_exists($pageRender, 'getCacheFile')) {
+				$cacheFile = $pageRender->getCacheFile($page, $options);
+				if (is_object($cacheFile) && method_exists($cacheFile, 'exists') && $cacheFile->exists() && method_exists($cacheFile, 'remove')) {
+					$cacheFile->remove();
+				}
+			}
+		} catch (Throwable $e) {
+			$wire->log?->error('Inertia PageRender cache cleanup failed: ' . $e->getMessage());
+		}
+	}
+
+	/**
 	 * Execute an Inertia-enabled Admin `Process` module directly during `Page::render`
 	 * so full-page Inertia workspaces bypass classic `wire/core/admin.php` (`AdminThemeUikit`, `JqueryCore`, `JqueryUI`)
 	 * while preserving ProcessWire's native `ProcessController` RBAC permission checks and URL segment dispatch.
 	 */
 	protected function executeAdminProcess(HookEvent $event, Page $page): void
 	{
-		$wire = $this->wire();
-		if ($this->syncJsonToPost) {
-			$this->request->syncJsonToPost();
-		} else {
-			$this->request->syncCsrfToPost();
-		}
-		$this->enforceDemoModeGuard();
-
-		// Allow classic AdminThemeUikit flyout navigation requests (`navJSON`) to run through standard admin.php
-		if (strtolower((string) $wire->input->urlSegment1) === 'navjson') {
-			return;
-		}
-
-		if ($this->checkVersionConflict()) {
-			$this->response->applyHeaders();
-			$event->replace = true;
-			$event->return = '';
-
-			return;
-		}
-
-		$wire->pages->setOutputFormatting(false);
-
-		if (!$wire->breadcrumbs instanceof Breadcrumbs) {
-			$breadcrumbs = new Breadcrumbs();
-			$this->wire($breadcrumbs);
-			$wire->wire('breadcrumbs', $breadcrumbs);
-			foreach ($page->parents() as $parent) {
-				if ($parent instanceof Page && $parent->id > 1) {
-					$breadcrumbs->add(new Breadcrumb($parent->url, (string) $parent->get('title|name')));
-				}
-			}
-		}
-
-		$rawProcess = $page->getUnformatted('process') ?: $page->process;
-		$controller = new ProcessController();
-		$this->wire($controller);
-		if ($rawProcess instanceof Process) {
-			$controller->setProcess($rawProcess);
-		} else {
-			$controller->setProcessName((string) $rawProcess);
-		}
-
-		try {
-			$process = $controller->getProcess();
-			if (!$process instanceof Process) {
-				return;
-			}
-
-			// If the Process explicitly opts out of full-page admin rendering on this route,
-			// defer to classic wire/core/admin.php (or force a 409 X-Inertia-Location redirect on XHR visits).
-			if (
-				method_exists($process, 'inertiaFullPageAdmin')
-				&& !$process->inertiaFullPageAdmin()
-			) {
-				if ($this->request->isInertia()) {
-					$this->location($wire->input->url(true));
-					$this->response->applyHeaders();
-					$event->replace = true;
-					$event->return = '';
+		$this->adminProcessExecutor->execute(
+			$event,
+			$page,
+			fn(): bool => $this->checkVersionConflict(),
+			fn(string $url): bool => $this->isSafeBackTarget($url),
+			function (?PageResponse $returnedResponse): string {
+				if ($returnedResponse instanceof PageResponse) {
+					$this->activePageResponse = $returnedResponse;
 				}
 
-				return;
-			}
-
-			$prevEntityEncode = function_exists('ProcessWire\\__') ? __(true, 'entityEncode', false) : null;
-			try {
-				$content = $controller->execute();
-			} finally {
-				if (function_exists('ProcessWire\\__')) {
-					__(true, 'entityEncode', $prevEntityEncode ?? 1);
-				}
-			}
-		} catch (WirePermissionException) {
-			if ($this->request->isInertia() && $wire->user->isGuest()) {
-				$adminUrl = (string) ($wire->config->urls->admin ?: '/processwire/');
-				$this->location(rtrim($adminUrl, '/') . '/login/');
-				$this->response->applyHeaders();
-				$event->replace = true;
-				$event->return = '';
-			}
-
-			return;
-		} catch (Wire404Exception) {
-			return;
-		}
-
-		if ($content instanceof PageResponse) {
-			$this->activePageResponse = $content;
-		}
-
-		if ($this->activePageResponse !== null) {
-			$event->replace = true;
-			$event->return = $this->resolveActiveResponseOutput();
-
-			return;
-		}
-
-		if ($content instanceof Response) {
-			$content->applyHeaders();
-			$event->replace = true;
-			$event->return = '';
-
-			return;
-		}
-
-		if (is_string($content)) {
-			if ($this->isJsonString($content) && !headers_sent() && PHP_SAPI !== 'cli') {
-				header('Content-Type: application/json; charset=utf-8');
-			}
-			$event->replace = true;
-			$event->return = $content;
-		}
-	}
-
-	protected function isJsonString(string $value): bool
-	{
-		$trimmed = ltrim($value);
-		if ($trimmed === '' || ($trimmed[0] !== '{' && $trimmed[0] !== '[')) {
-			return false;
-		}
-
-		return json_validate($trimmed);
+				return $this->resolveActiveResponseOutput();
+			},
+			$this->_('Request security validation failed. Please refresh the page and try again.')
+		);
 	}
 
 	protected function hookBeforeTemplateFileRender(HookEvent $event): void
 	{
+		$wire = $event->wire() ?? $this->wire();
 		/** @var Page|null $page */
-		$page = $this->wire()->page;
+		$page = $wire->page;
 		if ($page instanceof Page && $this->shouldHandlePage($page) && $this->checkVersionConflict()) {
 			$event->replace = true;
 			$event->return = '';
@@ -1632,13 +1735,22 @@ class Inertia extends WireData implements Module, ConfigurableModule
 
 	protected function hookAfterPageRender(HookEvent $event): void
 	{
+		$wire = $event->wire() ?? $this->wire();
+		$arg0 = $event->arguments(0);
+		if (is_string($arg0) && $arg0 !== '' && $wire->sanitizer->fieldName($arg0) === $arg0) {
+			return;
+		}
+
+		$page = $event->object;
 		if ($this->activePageResponse !== null) {
+			if ($page instanceof Page) {
+				$this->evictPageRenderCacheIfCreated($page, $event);
+			}
 			$event->return = $this->resolveActiveResponseOutput();
 
 			return;
 		}
 
-		$page = $event->object;
 		if ($page instanceof Page && ($this->shouldHandlePage($page) || $this->shouldHandleAdminPage($page)) && $this->checkVersionConflict()) {
 			$this->response->applyHeaders();
 			$event->return = '';
@@ -1656,7 +1768,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			$this->emitXsrfCookie();
 		}
 
-		$isInertiaWrite = $this->request->isInertia() && !$this->request->isDemoModeBlocked() && $this->request->isMutatingMethod();
+		$isInertiaWrite = $this->request->isInertia() && $this->request->isMutatingMethod();
 
 		if ($this->forceNextRedirect303 || $isInertiaWrite) {
 			$this->forceNextRedirect303 = false;
@@ -1666,11 +1778,82 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	}
 
 	/**
-	 * Automatically flag `clearHistory: true` in session when a user logs out.
+	 * Automatically clear encrypted history, purge session-flashed Inertia data/errors,
+	 * and rotate the XSRF cookie when a user logs out.
 	 */
 	protected function hookSessionLogout(HookEvent $event): void
 	{
+		$wire = $event->wire() ?? $this->wire();
+		$this->flashedData = [];
+		$this->consumeSessionFlash();
+		$this->errors->clear();
+		$this->preserveFragment(false);
 		$this->clearHistory(true);
+		$wire->session?->CSRF?->resetAll();
+		if ($this->autoShareCsrf) {
+			$this->emitXsrfCookie();
+		}
+	}
+
+	/**
+	 * Automatically clear pre-login history/OnceProp caches, purge stale guest flash/errors,
+	 * and refresh the XSRF cookie upon successful authentication.
+	 */
+	protected function hookSessionLoginSuccess(HookEvent $event): void
+	{
+		$wire = $event->wire() ?? $this->wire();
+		$this->flashedData = [];
+		$this->consumeSessionFlash();
+		$this->errors->clear();
+		$this->preserveFragment(false);
+		$this->clearHistory(true);
+		$wire->session?->CSRF?->resetAll();
+		if ($this->autoShareCsrf) {
+			$this->emitXsrfCookie();
+		}
+	}
+
+	/**
+	 * Validate Inertia module configuration (demo-mode lock and `ssrUrl` SSRF check) before saving.
+	 */
+	protected function hookBeforeSaveModuleConfig(HookEvent $event): void
+	{
+		$class = $event->arguments(0);
+		$className = is_object($class) ? $class->className() : (string) $class;
+		if ($className !== 'Inertia' && !str_ends_with($className, '\\Inertia')) {
+			return;
+		}
+
+		if ($this->request->isDemoMode()) {
+			$event->replace = true;
+			$event->return = false;
+
+			return;
+		}
+
+		$data = $event->arguments(1);
+		$hasSsrUrl = false;
+		$candidateSsrUrl = '';
+		if (is_array($data) && array_key_exists('ssrUrl', $data)) {
+			$hasSsrUrl = true;
+			$candidateSsrUrl = trim((string) $data['ssrUrl']);
+		} elseif ($data === 'ssrUrl') {
+			$hasSsrUrl = true;
+			$candidateSsrUrl = trim((string) $event->arguments(2));
+		}
+
+		if ($hasSsrUrl && $candidateSsrUrl !== '') {
+			$wire = $event->wire() ?? $this->wire();
+			$gateway = $this->ssrGateway instanceof HttpGateway ? $this->ssrGateway : new HttpGateway();
+			if ($gateway->wire() === null) {
+				$wire->wire($gateway);
+			}
+			if (!$gateway->isSafeSsrUrl(HttpGateway::normalizeUrl($candidateSsrUrl))) {
+				$wire->error($this->_('Invalid or unsafe SSR server URL.'));
+				$event->replace = true;
+				$event->return = false;
+			}
+		}
 	}
 
 	/**
@@ -1720,17 +1903,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			return;
 		}
 
-		$this->clearOnceCacheForPage($page, (string) $event->method);
-	}
-
-	/**
-	 * Clear `OnceProp` server-side `WireCache` entries according to `$page->template->cacheExpire`.
-	 *
-	 * @see PropResolver::clearOnceCacheForPage()
-	 */
-	public function clearOnceCacheForPage(Page $page, string $eventMethod = 'saved'): void
-	{
-		$this->resolver->clearOnceCacheForPage($page, $eventMethod);
+		$this->resolver->clearOnceCacheForPage($page, (string) $event->method);
 	}
 
 	/**
@@ -1738,7 +1911,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	 */
 	private function regenerateTypesSafely(string $context): void
 	{
-		if (!(bool) $this->autoGenerateTypes || $this->isDemoMode()) {
+		if (!(bool) $this->autoGenerateTypes || $this->request->isDemoMode()) {
 			return;
 		}
 
@@ -1824,119 +1997,9 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	 */
 	protected function renderRootView(PageResponse $pageResponse, array $pageObject): string
 	{
-		$wire = $this->wire();
-		$config = $wire->config;
-		$files = $wire->files;
-		$templatesPath = rtrim((string) $config->paths->templates, '/\\');
-		$siteModulesPath = rtrim((string) $config->paths->siteModules, '/\\');
-		$stubsPath = __DIR__ . '/commands/stubs/templates';
-		$defaultStubFile = $stubsPath . '/_inertia.php';
-
-		$configuredView = trim((string) $this->rootView);
-		$viewName = $pageResponse->getRootView() ?? ($configuredView !== '' ? $configuredView : '_inertia.php');
-		if (!str_ends_with($viewName, '.php')) {
-			$viewName .= '.php';
-		}
-
-		$candidatePath = str_starts_with($viewName, '/')
-			? $viewName
-			: ($templatesPath !== '' ? $templatesPath . '/' . ltrim($viewName, '/') : '');
-
-		$resolvedCandidate = $candidatePath !== '' && is_file($candidatePath) ? realpath($candidatePath) : false;
-		$realTemplatesDir = $templatesPath !== '' && is_dir($templatesPath) ? realpath($templatesPath) : false;
-		$realSiteModulesDir = $siteModulesPath !== '' && is_dir($siteModulesPath) ? realpath($siteModulesPath) : false;
-		$realStubsDir = is_dir($stubsPath) ? realpath($stubsPath) : false;
-
-		$isAllowedPath = false;
-		if (is_string($resolvedCandidate)) {
-			if (is_string($realTemplatesDir) && str_starts_with($resolvedCandidate, $realTemplatesDir . DIRECTORY_SEPARATOR)) {
-				$isAllowedPath = true;
-			} elseif (is_string($realSiteModulesDir) && str_starts_with($resolvedCandidate, $realSiteModulesDir . DIRECTORY_SEPARATOR)) {
-				$isAllowedPath = true;
-			} elseif (is_string($realStubsDir) && str_starts_with($resolvedCandidate, $realStubsDir . DIRECTORY_SEPARATOR)) {
-				$isAllowedPath = true;
-			}
-		}
-
-		$targetFile = $isAllowedPath && is_string($resolvedCandidate)
-			? $resolvedCandidate
-			: (is_string($realStubsDir) ? $realStubsDir . '/_inertia.php' : $defaultStubFile);
-
-		/** @var Page|null $currentPage */
-		$currentPage = $pageResponse->getPage() ?? $wire->page;
-		$pageViewData = ($currentPage instanceof Page && method_exists($currentPage, 'inertiaViewData'))
-			? (array) $currentPage->inertiaViewData($pageObject)
-			: [];
-		$pageWithViewData = ($currentPage instanceof Page && method_exists($currentPage, 'inertiaWithViewData'))
-			? (array) $currentPage->inertiaWithViewData($pageObject)
-			: [];
-
-		$wireProcess = $wire->process;
-		$currentProcess = $pageResponse->getProcess() ?? ($wireProcess instanceof Process ? $wireProcess : null);
-		$processViewData = ($currentProcess instanceof Process && method_exists($currentProcess, 'inertiaViewData'))
-			? (array) $currentProcess->inertiaViewData($pageObject)
-			: [];
-		$processWithViewData = ($currentProcess instanceof Process && method_exists($currentProcess, 'inertiaWithViewData'))
-			? (array) $currentProcess->inertiaWithViewData($pageObject)
-			: [];
-
-		$vars = PropResolver::mergeViewData(
-			$this->sharedViewData,
-			$pageViewData,
-			$pageWithViewData,
-			$processViewData,
-			$processWithViewData,
-			$pageResponse->viewData()
-		);
-
-		foreach ($vars as $varKey => $varVal) {
-			if ($varVal instanceof Closure) {
-				$vars[$varKey] = $varVal($pageObject);
-			}
-		}
-
-		$locale = isset($vars['locale']) && is_scalar($vars['locale']) && trim((string) $vars['locale']) !== ''
-			? trim((string) $vars['locale'])
-			: 'en';
-
 		$ssr = $this->resolveSsrForPageObject($pageObject, $pageResponse);
-		$ssrHead = ($ssr !== null && $ssr->headMarkup() !== '') ? $ssr->headMarkup() : '';
-		$rawCustomHead = $vars['head'] ?? '';
-		if (is_array($rawCustomHead)) {
-			$customHead = implode("\n\t", array_values(array_filter(
-				array_map(static fn(mixed $item): string => is_scalar($item) ? trim((string) $item) : '', $rawCustomHead),
-				static fn(string $item): bool => $item !== ''
-			)));
-		} else {
-			$customHead = is_scalar($rawCustomHead) ? trim((string) $rawCustomHead) : '';
-		}
-		$headParts = array_values(array_filter([$ssrHead, $customHead], static fn(string $part): bool => $part !== ''));
 
-		$vars['locale'] = $locale;
-		$vars['head'] = implode("\n\t", $headParts);
-		$vars['inertia'] = $this;
-		$vars['pageObject'] = $pageObject;
-
-		$allowedPaths = array_values(array_filter([
-			is_string($realTemplatesDir) ? $realTemplatesDir : ($templatesPath !== '' ? $templatesPath : null),
-			is_string($realSiteModulesDir) ? $realSiteModulesDir : ($siteModulesPath !== '' ? $siteModulesPath : null),
-			is_string($realStubsDir) ? $realStubsDir : $stubsPath,
-		]));
-
-		if (is_file($targetFile)) {
-			return (string) $files->render($targetFile, $vars, [
-				'allowDotDot' => false,
-				'allowedPaths' => $allowedPaths,
-			]);
-		}
-
-		$safeLocale = $wire->sanitizer->entities($locale);
-
-		return "<!DOCTYPE html>\n<html lang=\"{$safeLocale}\">\n<head>\n\t<meta charset=\"utf-8\" />\n\t<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n\t"
-			. $vars['head']
-			. "\n</head>\n<body>\n\t"
-			. $this->app($pageObject)
-			. "\n</body>\n</html>";
+		return $this->rootViewRenderer->render($pageResponse, $pageObject, $this->sharedViewData, $ssr);
 	}
 
 	/**
@@ -1962,6 +2025,18 @@ class Inertia extends WireData implements Module, ConfigurableModule
 
 		if ($rootPath === '') {
 			return '';
+		}
+
+		$hotFile = $viteModule instanceof Vite
+			? trim((string) ($viteModule->hotFile ?? ''))
+			: 'hot';
+		if ($hotFile !== '') {
+			$hotPath = (str_starts_with($hotFile, '/') || preg_match('/^[A-Za-z]:[\\\\\/]/', $hotFile) === 1)
+				? $hotFile
+				: rtrim($rootPath, '/\\') . '/' . ltrim($hotFile, '/\\');
+			if (is_file($hotPath)) {
+				return 'hot:' . (string) md5_file($hotPath);
+			}
 		}
 
 		$base = rtrim($rootPath, '/\\') . '/' . trim($buildDir, '/\\') . '/';
@@ -2082,12 +2157,28 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			return;
 		}
 
+		$config = $this->wire()->config;
+		$cookiePath = (string) ($config->urls->get('root') ?: '/');
+		$cookieOpts = is_array($config->cookieOptions)
+			? array_change_key_case($config->cookieOptions, CASE_LOWER)
+			: [];
+		$rawDomain = $cookieOpts['domain'] ?? ($config->sessionCookieDomain ?? '');
+		$cookieDomain = is_scalar($rawDomain) ? trim((string) $rawDomain) : '';
+		$rawSameSiteCfg = $cookieOpts['samesite'] ?? ($config->sessionCookieSameSite ?: 'Lax');
+		$rawSameSite = ucfirst(strtolower(trim(is_scalar($rawSameSiteCfg) ? (string) $rawSameSiteCfg : 'Lax')));
+		$sameSite = in_array($rawSameSite, ['Lax', 'Strict', 'None'], true) ? $rawSameSite : 'Lax';
+		$isSecureCookie = array_key_exists('secure', $cookieOpts)
+			? (bool) $cookieOpts['secure']
+			: ((bool) $config->https || (bool) ($config->sessionCookieSecure ?? false));
+
 		$this->wire()->input->cookie->set('XSRF-TOKEN', $csrf['value'], [
+			'expire' => 0,
 			'age' => 0,
-			'path' => null,
-			'secure' => null,
+			'path' => $cookiePath,
+			'domain' => $cookieDomain !== '' ? $cookieDomain : null,
+			'secure' => ($sameSite === 'None' || $isSecureCookie) ? true : null,
 			'httponly' => false,
-			'samesite' => 'Lax',
+			'samesite' => $sameSite,
 			'fallback' => false,
 		]);
 	}
@@ -2266,27 +2357,37 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		$this->applyConfigMap($global);
 	}
 
-	public function isDemoMode(): bool
-	{
-		return $this->request->isDemoMode();
-	}
-
 	/**
 	 * When ProcessWire demo mode (`$config->demo = true`) is active, purge state-mutating request input
 	 * (`$input->post`, `$_FILES`, JSON body) and emit a one-time warning notice.
 	 */
-	protected function enforceDemoModeGuard(): void
+	public function enforceDemoModeGuard(): bool
 	{
 		if (!$this->request->isDemoModeBlocked()) {
-			return;
+			return false;
+		}
+
+		$wire = $this->wire();
+		$page = $wire->page;
+		if ($page instanceof Page && $page->id > 0 && $page->template instanceof Template && $page->template->name === 'admin') {
+			$rawProcess = $page->getUnformatted('process') ?: $page->process;
+			$processName = $rawProcess instanceof Process ? $rawProcess->className() : (string) $rawProcess;
+			if ($processName === 'ProcessLogin') {
+				return false;
+			}
 		}
 
 		$this->request->purgeMutatingGlobals();
+		if ($this->inAdmin()) {
+			$wire->config->js('demo', true);
+		}
 
 		if (!$this->demoWarningEmitted) {
 			$this->demoWarningEmitted = true;
-			$this->wire()->warning($this->_('Changes cannot be saved in demo mode.'));
+			$wire->warning($this->_('Changes cannot be saved in demo mode.'));
 		}
+
+		return true;
 	}
 
 	protected function inAdmin(): bool
@@ -2294,14 +2395,16 @@ class Inertia extends WireData implements Module, ConfigurableModule
 		$wire = $this->wire();
 		/** @var Page|null $page */
 		$page = $wire->page;
-		if ($page instanceof Page && $page->template instanceof Template && $page->template->name === 'admin') {
-			return true;
+		if ($page instanceof Page && $page->id > 0) {
+			return $page->template instanceof Template && $page->template->name === 'admin';
 		}
 
 		$requestUrl = (string) $wire->input->url(false);
 		$adminUrl = (string) ($wire->config->urls->admin ?: '/processwire/');
+		$adminPrefix = '/' . trim($adminUrl, '/') . '/';
+		$trimmedAdmin = rtrim($adminPrefix, '/');
 
-		return $adminUrl !== '' && str_starts_with($requestUrl, $adminUrl);
+		return $trimmedAdmin !== '' && ($requestUrl === $trimmedAdmin || str_starts_with($requestUrl, $adminPrefix));
 	}
 
 	protected function isTracySupportEnabled(): bool
@@ -2324,6 +2427,30 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	}
 
 	/**
+	 * @param array<string, string> $headers
+	 * @return array<string, string>
+	 */
+	private static function redactDiagnosticHeaders(array $headers): array
+	{
+		$sensitive = [
+			'cookie' => true,
+			'set-cookie' => true,
+			'authorization' => true,
+			'proxy-authorization' => true,
+			'x-csrf-token' => true,
+			'x-xsrf-token' => true,
+		];
+
+		$sanitized = [];
+		foreach ($headers as $name => $value) {
+			$lower = strtolower((string) $name);
+			$sanitized[$name] = isset($sensitive[$lower]) ? '[REDACTED]' : $value;
+		}
+
+		return $sanitized;
+	}
+
+	/**
 	 * @param array<string, mixed> $pageObject
 	 */
 	protected function recordTracyDiagnostics(array $pageObject): void
@@ -2337,9 +2464,9 @@ class Inertia extends WireData implements Module, ConfigurableModule
 			'component' => $pageObject['component'] ?? '',
 			'url' => $pageObject['url'] ?? '',
 			'version' => $pageObject['version'] ?? '',
-			'inboundHeaders' => $this->request->headers(),
-			'outgoingHeaders' => $this->response->getHeaders(),
-			'flash' => $pageObject['flash'] ?? [],
+			'inboundHeaders' => self::redactDiagnosticHeaders($this->request->headers()),
+			'outgoingHeaders' => self::redactDiagnosticHeaders($this->response->getHeaders()),
+			'flash' => (array) ($pageObject['flash'] ?? []),
 			'sharedProps' => $pageObject['sharedProps'] ?? [],
 			'deferredProps' => $pageObject['deferredProps'] ?? [],
 			'mergeProps' => $pageObject['mergeProps'] ?? [],
