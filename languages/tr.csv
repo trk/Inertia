@@ -1,4 +1,6 @@
 en,tr,description,file,hash
+"Request security validation failed. Please refresh the page and try again.","İstek güvenlik doğrulaması başarısız oldu. Lütfen sayfayı yenileyip tekrar deneyin.",,site/modules/Inertia/Inertia.module.php,2ab511afbb4b65fdb0d48f1994d9b2f6
+"Invalid or unsafe SSR server URL.","Geçersiz veya güvenli olmayan SSR sunucu URL'si.",,site/modules/Inertia/Inertia.module.php,b3da1737dfa4947a24cad876c2962ba7
 "config save","yapılandırma kaydı",,site/modules/Inertia/Inertia.module.php,b4f87813372d094e257fc5f74251ff61
 "schema save","şema kaydı",,site/modules/Inertia/Inertia.module.php,d53279b4f6bcac61c7962fd1669de05b
 "Inertia type generation after %1$s failed: %2$s","%1$s sonrasında Inertia tip üretimi başarısız oldu: %2$s",,site/modules/Inertia/Inertia.module.php,cd6fffb57d24932313ccc97b49e3493d
@@ -46,8 +48,8 @@ Inertia,Inertia,,site/modules/Inertia/Inertia.module.php,b19a24ee5c287f42ee1d465
 "Inertia PageResponse render error: %s","Inertia PageResponse işleme hatası: %s",,site/modules/Inertia/src/PageResponse.php,99cb79fd421e069897ddb3db1c7e8055
 "Write operations are disabled in demo mode.","Demo modunda yazma işlemleri devre dışıdır.",,site/modules/Inertia/src/Request.php,0d0aace8ef3cfee16f1b3d2d92a3355b
 "Request security validation failed. Please refresh the page and try again.","İstek güvenlik doğrulaması başarısız oldu. Lütfen sayfayı yenileyip tekrar deneyin.",,site/modules/Inertia/src/Request.php,2ab511afbb4b65fdb0d48f1994d9b2f6
-"SSR server returned HTTP %1$d at %2$s","SSR sunucusu %2$s adresinde HTTP %1$d döndürdü",,site/modules/Inertia/src/Ssr/HttpGateway.php,83c12b4e04161c2872757ad6bd42d816
 "SSR server unreachable or returned empty response at %s","%s adresindeki SSR sunucusuna ulaşılamadı veya boş yanıt döndürdü",,site/modules/Inertia/src/Ssr/HttpGateway.php,2e3ae0c3109c4a691195b97012234964
+"SSR server returned HTTP %1$d at %2$s","SSR sunucusu %2$s adresinde HTTP %1$d döndürdü",,site/modules/Inertia/src/Ssr/HttpGateway.php,83c12b4e04161c2872757ad6bd42d816
 "SSR server returned malformed JSON payload.","SSR sunucusu hatalı biçimlendirilmiş JSON verisi döndürdü.",,site/modules/Inertia/src/Ssr/HttpGateway.php,906d3c5c3e20d4b7d402c1b056471b15
 "SSR dispatch exception: %s","SSR gönderim istisnası: %s",,site/modules/Inertia/src/Ssr/HttpGateway.php,91d2df8a483d9b2cf8380ea3bedcfd75
 "Inertia session read (%1$s) failed: %2$s","Inertia oturum okuma işlemi (%1$s) başarısız oldu: %2$s",,site/modules/Inertia/src/Support/ErrorBag.php,252741db38278ffeb7b85276af155173

@@ -1,4 +1,6 @@
 en,fr,description,file,hash
+"Request security validation failed. Please refresh the page and try again.","La validation de sécurité de la requête a échoué. Veuillez actualiser la page et réessayer.",,site/modules/Inertia/Inertia.module.php,2ab511afbb4b65fdb0d48f1994d9b2f6
+"Invalid or unsafe SSR server URL.","URL du serveur SSR invalide ou non sécurisée.",,site/modules/Inertia/Inertia.module.php,b3da1737dfa4947a24cad876c2962ba7
 "config save","enregistrement de la configuration",,site/modules/Inertia/Inertia.module.php,b4f87813372d094e257fc5f74251ff61
 "schema save","enregistrement du schéma",,site/modules/Inertia/Inertia.module.php,d53279b4f6bcac61c7962fd1669de05b
 "Inertia type generation after %1$s failed: %2$s","Échec de la génération des types Inertia après %1$s : %2$s",,site/modules/Inertia/Inertia.module.php,cd6fffb57d24932313ccc97b49e3493d
@@ -46,8 +48,8 @@ Inertia,Inertia,,site/modules/Inertia/Inertia.module.php,b19a24ee5c287f42ee1d465
 "Inertia PageResponse render error: %s","Erreur de rendu PageResponse Inertia : %s",,site/modules/Inertia/src/PageResponse.php,99cb79fd421e069897ddb3db1c7e8055
 "Write operations are disabled in demo mode.","Les opérations d'écriture sont désactivées en mode démo.",,site/modules/Inertia/src/Request.php,0d0aace8ef3cfee16f1b3d2d92a3355b
 "Request security validation failed. Please refresh the page and try again.","La validation de sécurité de la requête a échoué. Veuillez actualiser la page et réessayer.",,site/modules/Inertia/src/Request.php,2ab511afbb4b65fdb0d48f1994d9b2f6
-"SSR server returned HTTP %1$d at %2$s","Le serveur SSR a renvoyé HTTP %1$d sur %2$s",,site/modules/Inertia/src/Ssr/HttpGateway.php,83c12b4e04161c2872757ad6bd42d816
 "SSR server unreachable or returned empty response at %s","Serveur SSR injoignable ou réponse vide renvoyée sur %s",,site/modules/Inertia/src/Ssr/HttpGateway.php,2e3ae0c3109c4a691195b97012234964
+"SSR server returned HTTP %1$d at %2$s","Le serveur SSR a renvoyé HTTP %1$d sur %2$s",,site/modules/Inertia/src/Ssr/HttpGateway.php,83c12b4e04161c2872757ad6bd42d816
 "SSR server returned malformed JSON payload.","Le serveur SSR a renvoyé une charge utile JSON mal formée.",,site/modules/Inertia/src/Ssr/HttpGateway.php,906d3c5c3e20d4b7d402c1b056471b15
 "SSR dispatch exception: %s","Exception d'envoi SSR : %s",,site/modules/Inertia/src/Ssr/HttpGateway.php,91d2df8a483d9b2cf8380ea3bedcfd75
 "Inertia session read (%1$s) failed: %2$s","Échec de la lecture de session Inertia (%1$s) : %2$s",,site/modules/Inertia/src/Support/ErrorBag.php,252741db38278ffeb7b85276af155173
