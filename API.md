@@ -4,10 +4,10 @@ Inertia.js v3 server-side protocol and lifecycle adapter for ProcessWire.
 
 ## Value type
 
-- **Module Class**: `ProcessWire\Inertia` (`Inertia.module.php`) — `ConfigurableModule` registered at `$this->wire()->inertia`.
+- **Module Class**: `ProcessWire\Inertia` (`Inertia.module.php`) — `ConfigurableModule` registered at `$this->wire()->inertia` (`Inertia::JSON_HTML_SAFE_FLAGS` standardizes HTML-safe JSON encoding across `app()`, `MarkupInertia`, and `InputfieldInertia`).
 - **Context Trait**: `Totoglu\Inertia\InteractWithInertia` (`src/InteractWithInertia.php`) — trait for Custom Page Classes (`site/classes/DefaultPage.php`, `site/classes/*Page.php`), `Process` modules, `Markup` modules, and `Inputfield` modules.
 - **Extendable Base Classes**:
-  - `Totoglu\Inertia\ProcessInertia` (`src/ProcessInertia.php`) — abstract `Process` base class with `InteractWithInertia` and full-page admin Inertia lifecycle integration (`inertiaFullPageAdmin(): true`).
+  - `Totoglu\Inertia\ProcessInertia` (`src/ProcessInertia.php`) — abstract `Process` base class with `InteractWithInertia`, full-page admin Inertia lifecycle integration (`inertiaFullPageAdmin(): true`), and automatic mutating CSRF enforcement (`shouldValidateCsrf(): true`).
   - `Totoglu\Inertia\MarkupInertia` (`src/MarkupInertia.php`) — abstract `ModuleJS` base class implementing `InertiaSerializable` and `InteractWithInertia` for server-configured Inertia islands and direct prop composition.
   - `Totoglu\Inertia\InputfieldInertia` (`src/InputfieldInertia.php`) — abstract `Inputfield` base class implementing `InertiaSerializable` and `InteractWithInertia` for classic ProcessWire forms and full-page Inertia forms.
 - **Contracts & Fieldtype Trait**:
@@ -83,11 +83,9 @@ return $page->inertiaRender('Articles/Show');
 | `shouldHandlePage` | `public function shouldHandlePage(Page $page): bool` | Returns `true` if the given `Page` uses an Inertia-enabled template. |
 | `render` | `public function render(string\|UnitEnum $component, array $props = []): PageResponse` | Creates and registers an active `PageResponse` for the current request. |
 | `share` | `public function share(string\|array $key, mixed $value = null): self` | Shares global props across all Inertia responses (supports dot-notation and lazy closures). |
-| `shared` | `public function shared(string\|array $key, mixed $value = null): self` | Fluent alias for `share()`. |
 | `getShared` | `public function getShared(?string $key = null, mixed $default = null): mixed` | Retrieves a shared prop by key or all shared props. |
 | `flushShared` | `public function flushShared(): self` | Clears all registered shared props. |
 | `viewData` | `public function viewData(string\|array $key, mixed $value = null): self` | Shares server-only PHP variables (`$locale`, `$head`, `$scripts`, `$styles`, etc., including `Closure($pageObject)` resolvers) with the Root View (`_inertia.php`). |
-| `withViewData` | `public function withViewData(string\|array $key, mixed $value = null): self` | Fluent alias for `viewData()`. |
 | `getViewData` | `public function getViewData(?string $key = null, mixed $default = null): mixed` | Retrieves a shared Root View variable by key or all shared Root View variables. |
 | `flushViewData` | `public function flushViewData(): self` | Clears all registered shared Root View variables. |
 | `setRootView` | `public function setRootView(string $view): self` | Overrides the default Root View template filename (default `_inertia.php`). |
@@ -117,12 +115,11 @@ return $page->inertiaRender('Articles/Show');
 | `*registerProviders` | `public function ___registerProviders(): void` | Hookable method fired when `ProviderRegistry` boots. |
 | `*buildPageObject` | `public function ___buildPageObject(PageResponse $pageResponse): array` | Hookable method compiling a `PageResponse` into the Inertia v3 Page Object array. |
 | `*renderPageResponse` | `public function ___renderPageResponse(PageResponse $pageResponse): string` | Hookable method rendering a `PageResponse` into JSON (`X-Inertia: true`) or the Root View HTML shell. |
+| `*uninstall` | `public function ___uninstall(): void` | Hookable lifecycle method purging `WireCache` (`inertia-once`) and `Session` (`inertia`) namespaces on module uninstall. |
 | `getActiveResponse` | `public function getActiveResponse(): ?PageResponse` | Returns the active `PageResponse` for the current request, if any. |
 | `setSsrGateway` | `public function setSsrGateway(SsrGatewayInterface $gateway): self` | Overrides the SSR Gateway implementation (`Totoglu\Inertia\Ssr\HttpGateway` by default). |
-| `clearOnceCacheForPage` | `public function clearOnceCacheForPage(Page $page, string $eventMethod = 'saved'): void` | Invalidates `OnceProp` `WireCache` entries according to `$page->template->cacheExpire`. |
-| `isDemoMode` | `public function isDemoMode(): bool` | Returns `true` when `$config->demo = true` is active. |
 | `typeGenerator` | `public function typeGenerator(): TypeGenerator` | Returns a `TypeGenerator` bound to this module. |
-| `version` | `public function version(string\|Closure\|null $version): self` | Overrides the asset version string or resolver (defaults to Vite `manifest.json` hash). |
+| `version` | `public function version(string\|Closure\|null $version): self` | Overrides the asset version string or resolver (defaults to Vite `hot` or `manifest.json` hash). |
 | `getVersion` | `public function getVersion(): string` | Resolves and returns the active asset version string. |
 
 ## `Totoglu\Inertia\InteractWithInertia` Trait Methods
@@ -147,13 +144,13 @@ Used by `site/classes/DefaultPage.php`, `site/classes/*Page.php`, `ProcessInerti
 1. **Component Props (`Inertia::doBuildPageObject`):**
    `baselineProps` (`errors`, `flash`, `csrf`) → `$inertia->sharedProps` → `$page->inertiaShared()` → `$process->inertiaShared()` → nested `InertiaSerializable::inertiaShared()` → `$page->inertiaWithData()` → `$process->inertiaWithData()` → `$pageResponse->rawProps()`.
 2. **Root View Variables (`Inertia::renderRootView` via `PropResolver::mergeViewData`):**
-   `$inertia->sharedViewData` → `$page->inertiaViewData($pageObject)` → `$page->inertiaWithViewData($pageObject)` → `$process->inertiaViewData($pageObject)` → `$process->inertiaWithViewData($pageObject)` → `$pageResponse->viewData()`. List keys `scripts` and `styles` merge additively with deduplication; `head` accepts `string` or `list<string>` and merges with SSR `<head>` output.
+   `$inertia->sharedViewData` → `$page->inertiaViewData($pageObject)` → `$page->inertiaWithViewData($pageObject)` → `$process->inertiaViewData($pageObject)` → `$process->inertiaWithViewData($pageObject)` → `$pageResponse->getViewData()`. List keys `scripts` and `styles` merge additively with deduplication; `head` accepts `string` or `list<string>` and merges with SSR `<head>` output.
 
 ## `Totoglu\Inertia\Provider\ProviderRegistry` & DataProviders
 
 | Class / Method | Signature | Description |
 |---|---|---|
-| `ProviderRegistry::providePage` | `public function providePage(Page $page): array` | Resolves the matching `TemplateDataProvider` for `$page->template` and returns the serialized `Page` array (`id`, `name`, `title`, `url`, `httpUrl`, `template`, `created`, `modified`, field values, and `extraData()`). |
+| `ProviderRegistry::providePage` | `public function providePage(Page $page): array` | Delegates `User` instances to `provideUser()`, enforces `TemplateDataProvider::isAccessiblePage()`, and returns the serialized `Page` array (`id`, `name`, `title`, `url`, `httpUrl`, `template`, `created`, `modified`, field values, and `extraData()`). |
 | `ProviderRegistry::provideUser` | `public function provideUser(User $user): array` | Serializes `$user` via the active `UserDataProvider`. |
 | `ProviderRegistry::resolveTemplateProvider` | `public function resolveTemplateProvider(string\|Template $template): TemplateDataProvider` | Returns the specific `TemplateDataProvider` for `$template` or the wildcard `['*']` fallback. |
 | `ProviderRegistry::resolveFieldProvider` | `public function resolveFieldProvider(Field\|object\|string $target): FieldDataProvider` | Resolves by `field:<name>` override, `InertiaFieldtypeInterface` implementation (`FieldtypeFieldDataProvider`), exact `Fieldtype` / object class name, or `is_a()` inheritance fallback to `ScalarFieldDataProvider`. |
@@ -166,13 +163,13 @@ Used by `site/classes/DefaultPage.php`, `site/classes/*Page.php`, `ProcessInerti
 | `FieldDataProvider::phpType` | `public function phpType(Field $field): string` | PHPDoc `@property` type for `site/classes/*Page.php`. |
 | `FieldDataProvider::tsType` | `public function tsType(Field $field): string` | TypeScript property type for `inertia.d.ts`. |
 | `FieldDataProvider::tsDefinitions` | `public function tsDefinitions(?Field $field = null): array` | Auxiliary TypeScript interfaces (`array<string, string>`) emitted into `inertia.d.ts`. |
-| `MediaFieldDataProvider::formatPageimage` | `public static function formatPageimage(Pageimage $image): array` | Serializes `Pageimage` (`name`, `url`, `httpUrl`, `description`, `ext`, `filesize`, `width`, `height`, `focus: {top, left, zoom}`), automatically appending `srcset`, `sizes`, `sources`, `lqip`, `dominantColor`, `palette`, `colorTheme`, and `imageHash` when `InterventionImage` is installed. |
-| `MediaFieldDataProvider::isInterventionImageInstalled` | `public static function isInterventionImageInstalled(?ProcessWire $wire = null): bool` | Returns `true` when the `InterventionImage` module is installed in ProcessWire. |
+| `MediaFieldDataProvider::formatPageimage` | `public static function formatPageimage(Pageimage $image): array` | Serializes core `Pageimage` metadata (`name`, `url`, `httpUrl`, `description`, `ext`, `filesize`, `width`, `height`, `focus: {top, left, zoom}`). |
+| `HttpGateway::isSafeSsrUrl` | `public function isSafeSsrUrl(string $url): bool` | Validates that an SSR endpoint targets strict loopback (`127.0.0.1`, `::1`, `localhost`) or `$config->inertiaSsrAllowedHosts` and fails closed on empty DNS. |
 
 ## Extendable Base Classes & Contracts (`Totoglu\Inertia`)
 
 ### 1. `Totoglu\Inertia\ProcessInertia`
-Abstract `Process` base class (`extends ProcessWire\Process`, uses `InteractWithInertia`). Returning `$this->inertiaRender('Component', $props)` from `___execute*()` intercepts `ProcessController::execute` and `Page::render` to serve either `X-Inertia: true` JSON or the full-page admin Root View.
+Abstract `Process` base class (`extends ProcessWire\Process`, uses `InteractWithInertia`). Returning `$this->inertiaRender('Component', $props)` from `___execute*()` intercepts `ProcessController::execute` and `Page::render` to serve either `X-Inertia: true` JSON or the full-page admin Root View. Exposes `shouldValidateCsrf(): bool` (`true` by default) to enforce automatic CSRF validation on mutating admin requests.
 
 ### 2. `Totoglu\Inertia\MarkupInertia`
 Abstract `ModuleJS` base class (`extends ProcessWire\ModuleJS implements InertiaSerializable`, uses `InteractWithInertia`):
@@ -204,7 +201,6 @@ Implemented by custom `Fieldtype` modules:
 | `getProcess` | `public function getProcess(): ?Process` | Returns the bound `Process` instance, if any. |
 | `flash` | `public function flash(string\|array $key, mixed $value = null): self` | Flashes custom key-value data onto this response's `page.flash` object. |
 | `withViewData` | `public function withViewData(string\|array $key, mixed $value = null): self` | Passes server-only PHP variables to `_inertia.php`, merging `scripts` and `styles` lists additively. |
-| `viewData` | `public function viewData(string\|array\|null $key = null, mixed $value = null): array\|self` | Returns all response Root View variables when called with no arguments, or delegates to `withViewData()`. |
 | `getViewData` | `public function getViewData(?string $key = null, mixed $default = null): mixed` | Retrieves a response Root View variable by key or all response Root View variables. |
 | `rootView` | `public function rootView(string $view): self` | Overrides the Root View template filename or confined path for this response. |
 | `url` | `public function url(string $url): self` | Overrides the `url` field of the resolved Page Object. |
