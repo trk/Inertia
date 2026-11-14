@@ -164,11 +164,13 @@ trait InteractWithInertia
 			$this->inertiaWithViewData()
 		);
 
+		$enqueuedAny = false;
 		$styles = is_array($viewData['styles'] ?? null) ? $viewData['styles'] : [];
 		if ($config->styles) {
 			foreach ($styles as $styleUrl) {
-				if (is_string($styleUrl) && trim($styleUrl) !== '') {
+				if (is_string($styleUrl) && $this->isSafeAssetUrl($styleUrl)) {
 					$config->styles->add(trim($styleUrl));
+					$enqueuedAny = true;
 				}
 			}
 		}
@@ -176,8 +178,9 @@ trait InteractWithInertia
 		$scripts = is_array($viewData['scripts'] ?? null) ? $viewData['scripts'] : [];
 		if ($config->scripts) {
 			foreach ($scripts as $scriptUrl) {
-				if (is_string($scriptUrl) && trim($scriptUrl) !== '') {
+				if (is_string($scriptUrl) && $this->isSafeAssetUrl($scriptUrl)) {
 					$config->scripts->add(trim($scriptUrl));
+					$enqueuedAny = true;
 				}
 			}
 		}
@@ -189,10 +192,70 @@ trait InteractWithInertia
 			$mergedShared = is_array($existingShared) && is_array($resolvedShared)
 				? array_replace($existingShared, $resolvedShared)
 				: $resolvedShared;
+			if (is_array($mergedShared)) {
+				unset($mergedShared['__proto__'], $mergedShared['constructor'], $mergedShared['prototype']);
+			}
 			$config->js('InertiaShared', $mergedShared);
+			$enqueuedAny = true;
 		}
 
-		return $styles !== [] || $scripts !== [] || $shared !== [];
+		return $enqueuedAny;
+	}
+
+	/**
+	 * Reject dangerous client-side URI schemes, protocol-relative URLs, HTTPS-to-HTTP downgrades,
+	 * and untrusted cross-origin hosts before enqueuing island stylesheet or script URLs.
+	 */
+	protected function isSafeAssetUrl(string $url): bool
+	{
+		$trimmed = trim(str_replace(["\r", "\n", "\0"], '', $url));
+		if ($trimmed === '' || str_starts_with($trimmed, '//') || str_contains($trimmed, '\\')) {
+			return false;
+		}
+
+		$probe = (string) preg_replace('/[\x00-\x20]+/', '', $trimmed);
+		if (preg_match('/^(?:javascript|data|vbscript|blob|file|js):/i', $probe) === 1) {
+			return false;
+		}
+
+		if (preg_match('/^[a-zA-Z][a-zA-Z0-9+.-]*:/', $probe) === 1) {
+			if (preg_match('#^https?://#i', $trimmed) !== 1) {
+				return false;
+			}
+			$parts = parse_url($trimmed);
+			if (!is_array($parts) || empty($parts['host']) || isset($parts['user']) || isset($parts['pass'])) {
+				return false;
+			}
+
+			/** @var object $hostObj */
+			$hostObj = $this;
+			$config = $hostObj instanceof Wire ? $hostObj->wire()?->config : null;
+			if ($config !== null) {
+				if ((bool) $config->https && strtolower((string) ($parts['scheme'] ?? '')) !== 'https') {
+					return false;
+				}
+				$candidateHost = strtolower((string) $parts['host']);
+				$candidateAuthority = isset($parts['port']) ? $candidateHost . ':' . (int) $parts['port'] : $candidateHost;
+				$allowedHosts = [];
+				$currentHost = strtolower(trim((string) $config->httpHost));
+				if ($currentHost !== '') {
+					$allowedHosts[] = $currentHost;
+				}
+				if (is_array($config->httpHosts)) {
+					foreach ($config->httpHosts as $whitelisted) {
+						$norm = strtolower(trim((string) $whitelisted));
+						if ($norm !== '') {
+							$allowedHosts[] = $norm;
+						}
+					}
+				}
+				if ($allowedHosts !== [] && !in_array($candidateAuthority, $allowedHosts, true) && !in_array($candidateHost, $allowedHosts, true)) {
+					return false;
+				}
+			}
+		}
+
+		return true;
 	}
 
 	/**

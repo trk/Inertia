@@ -40,12 +40,26 @@ class UserDataProvider extends Wire
 	 */
 	public function provide(User $user, ProviderRegistry $registry): array
 	{
+		if ($user->id <= 0 || $user->isTrash() || $user->isUnpublished()) {
+			return [];
+		}
+
+		$viewer = $this->wire()?->user;
+		$isSelfOrAdmin = ($viewer instanceof User)
+			&& (
+				((int) $viewer->id === (int) $user->id)
+				|| $viewer->isSuperuser()
+				|| ($viewer->hasPermission('user-admin') && !$user->isSuperuser())
+			);
+
 		$roles = [];
-		$rolesField = $user->get('roles');
-		if (is_iterable($rolesField)) {
-			foreach ($rolesField as $role) {
-				if ($role instanceof Role && $role->name !== '') {
-					$roles[] = (string) $role->name;
+		if ($isSelfOrAdmin) {
+			$rolesField = $user->get('roles');
+			if (is_iterable($rolesField)) {
+				foreach ($rolesField as $role) {
+					if ($role instanceof Role && $role->name !== '') {
+						$roles[] = (string) $role->name;
+					}
 				}
 			}
 		}
@@ -53,13 +67,16 @@ class UserDataProvider extends Wire
 		$data = [
 			'id' => (int) $user->id,
 			'name' => (string) $user->name,
-			'email' => (string) $user->get('email'),
-			'roles' => array_values(array_unique($roles)),
+			'email' => $isSelfOrAdmin ? (string) $user->get('email') : '',
+			'roles' => $isSelfOrAdmin ? array_values(array_unique($roles)) : [],
 			'isLoggedin' => $user->isLoggedin(),
-			'isSuperuser' => $user->isSuperuser(),
+			'isSuperuser' => $isSelfOrAdmin ? $user->isSuperuser() : false,
 		];
 
 		foreach ($this->customFields($user->template) as $name => $field) {
+			if (!$isSelfOrAdmin && (!((bool) $field->useRoles) || !$field->viewable($user))) {
+				continue;
+			}
 			$data[$name] = $registry->transformField($field, $user);
 		}
 
@@ -185,6 +202,9 @@ TS;
 
 	private static function isSensitiveFieldName(string $name): bool
 	{
-		return preg_match('/^(?:.*_(?:secret|token|password|hash)|secret|token|password|api_key)$/i', $name) === 1;
+		return preg_match(
+			'/^(?:.*_(?:secret|token|password|pass|hash|salt|otp|key|code|codes)|(?:tfa|totp|recovery|backup|reset)_.*|secret|token|password|pass|hash|salt|otp|totp|tfa|api_key|private_key|auth_key)$/i',
+			$name
+		) === 1;
 	}
 }

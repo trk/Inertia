@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Totoglu\Inertia;
 
+use ProcessWire\Inertia;
 use ProcessWire\Inputfield;
 use ProcessWire\WireInputData;
 use Totoglu\Inertia\Contracts\InertiaSerializable;
@@ -57,10 +58,30 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 			return (string) $normalized;
 		}
 
-		$encoded = json_encode($normalized, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+		$encoded = json_encode($normalized, Inertia::JSON_HTML_SAFE_FLAGS);
 
 		return is_string($encoded) ? $encoded : '';
 	}
+
+	/**
+	 * Reserved superglobal and prototype-pollution keys stripped from decoded JSON input.
+	 *
+	 * @var list<string>
+	 */
+	private const array BLOCKED_JSON_KEYS = [
+		'GLOBALS',
+		'_GET',
+		'_POST',
+		'_COOKIE',
+		'_REQUEST',
+		'_SERVER',
+		'_ENV',
+		'_FILES',
+		'_SESSION',
+		'__proto__',
+		'constructor',
+		'prototype',
+	];
 
 	protected function sanitizeInertiaInput(mixed $raw): mixed
 	{
@@ -75,12 +96,36 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 			) {
 				$decoded = json_decode($trimmed, true, Request::MAX_JSON_DEPTH);
 				if (json_last_error() === JSON_ERROR_NONE) {
-					return $decoded;
+					return is_array($decoded) ? $this->sanitizeDecodedJsonTree($decoded) : $decoded;
 				}
 			}
 		}
 
 		return $raw;
+	}
+
+	/**
+	 * @param array<mixed, mixed> $data
+	 * @return array<string|int, mixed>
+	 */
+	private function sanitizeDecodedJsonTree(array $data, int $depth = 0): array
+	{
+		if ($depth >= Request::MAX_JSON_DEPTH) {
+			return [];
+		}
+
+		$clean = [];
+		foreach ($data as $key => $value) {
+			if (
+				is_string($key)
+				&& ($key === '' || strlen($key) > 128 || preg_match('/[\x00-\x20\x7F]/', $key) === 1 || in_array($key, self::BLOCKED_JSON_KEYS, true))
+			) {
+				continue;
+			}
+			$clean[$key] = is_array($value) ? $this->sanitizeDecodedJsonTree($value, $depth + 1) : $value;
+		}
+
+		return $clean;
 	}
 
 	/**
@@ -129,7 +174,7 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 		$safeVal = $this->encodeHtmlAttribute($hiddenVal);
 		$safeComponent = $this->encodeHtmlAttribute($component);
 
-		$jsonProps = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+		$jsonProps = json_encode($data, Inertia::JSON_HTML_SAFE_FLAGS);
 		$safeProps = $this->encodeHtmlAttribute(is_string($jsonProps) ? $jsonProps : '{}');
 
 		$out = '';
@@ -151,7 +196,7 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 		$component = is_string($data['component'] ?? null) ? $data['component'] : $this->inertiaComponent();
 		$safeComponent = $this->encodeHtmlAttribute($component);
 
-		$jsonProps = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+		$jsonProps = json_encode($data, Inertia::JSON_HTML_SAFE_FLAGS);
 		$safeProps = $this->encodeHtmlAttribute(is_string($jsonProps) ? $jsonProps : '{}');
 
 		return "<div class=\"pw-inertia-inputfield-island\" data-inertia-island=\"{$safeComponent}\" data-readonly=\"true\" data-props=\"{$safeProps}\"></div>";
@@ -176,6 +221,10 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 
 	public function ___processInput(WireInputData $input): self
 	{
+		if ((bool) $this->wire()->config->demo) {
+			return $this;
+		}
+
 		$name = (string) $this->attr('name');
 		if ($name === '' || !isset($input->$name)) {
 			return $this;

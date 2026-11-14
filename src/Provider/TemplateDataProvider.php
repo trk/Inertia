@@ -9,6 +9,7 @@ use ProcessWire\Fieldgroup;
 use ProcessWire\NullPage;
 use ProcessWire\Page;
 use ProcessWire\Template;
+use ProcessWire\User;
 use ProcessWire\Wire;
 use Totoglu\Inertia\Provider\Field\ScalarFieldDataProvider;
 
@@ -49,6 +50,9 @@ class TemplateDataProvider extends Wire
 		$data = self::basePageData($page, $registry);
 
 		foreach ($this->eligibleFields($page->template, ['title']) as $name => $field) {
+			if (!self::isFieldViewableOnPage($field, $page)) {
+				continue;
+			}
 			$data[$name] = $registry->transformField($field, $page);
 		}
 
@@ -151,6 +155,10 @@ class TemplateDataProvider extends Wire
 			? $page->template->fieldgroup->getField('title', true)
 			: null;
 
+		if ($titleField instanceof Field && !self::isFieldViewableOnPage($titleField, $page)) {
+			return (string) $page->name;
+		}
+
 		if ($registry !== null && $titleField instanceof Field) {
 			$transformed = (string) $registry->transformField($titleField, $page);
 
@@ -174,23 +182,83 @@ class TemplateDataProvider extends Wire
 	}
 
 	/**
-	 * Determine whether `$page` is an existing, non-trashed, published `Page` (or the current request `$page` when `$allowCurrentPage` is true).
+	 * Determine whether `$page` is an existing, non-trashed, published, and viewable `Page`
+	 * (or the current request `$page` when `$allowCurrentPage` is true).
 	 */
-	public static function isAccessiblePage(Page $page, bool $allowCurrentPage = false, ?Page $currentPage = null): bool
+	public static function isAccessiblePage(Page $page, bool $allowCurrentPage = false, ?Page $currentPage = null, int $depth = 0): bool
 	{
 		if ($page instanceof NullPage || $page->id <= 0 || $page->isTrash()) {
 			return false;
 		}
 
-		if ($page->isUnpublished()) {
-			if ($allowCurrentPage && $currentPage instanceof Page && $currentPage->id > 0 && $currentPage->id === $page->id) {
-				return true;
-			}
+		$isCurrentAllowed = $allowCurrentPage
+			&& $currentPage instanceof Page
+			&& $currentPage->id > 0
+			&& $currentPage->id === $page->id;
 
+		if ($page->isUnpublished() && !$isCurrentAllowed) {
 			return false;
 		}
 
+		if ($page->template instanceof Template) {
+			$hasAccessContext = (int) $page->id === 1
+				|| (int) $page->parent_id > 0
+				|| (bool) $page->template->useRoles
+				|| $page instanceof User
+				|| ($page->hasField('process') && (bool) $page->get('process'));
+
+			if ($hasAccessContext) {
+				if ($isCurrentAllowed) {
+					if (!$page->viewable(false) && !$page->editable()) {
+						return false;
+					}
+				} elseif (!$page->viewable(false)) {
+					return false;
+				}
+			}
+		}
+
+		if ($page instanceof \ProcessWire\RepeaterPage) {
+			if ($depth > 20 || $page->isHidden()) {
+				return false;
+			}
+			$forField = $page->getForField();
+			$directOwner = $page->getForPage();
+			if ($directOwner instanceof Page && $directOwner->id > 0 && $directOwner->id !== $page->id) {
+				if (!self::isAccessiblePage($directOwner, $allowCurrentPage, $currentPage, $depth + 1)) {
+					return false;
+				}
+				if ($forField instanceof Field && !self::isFieldViewableOnPage($forField, $directOwner)) {
+					return false;
+				}
+			} else {
+				$rootOwner = $page->getForPageRoot();
+				if ($rootOwner instanceof Page && $rootOwner->id > 0 && $rootOwner->id !== $page->id) {
+					if (!self::isAccessiblePage($rootOwner, $allowCurrentPage, $currentPage, $depth + 1)) {
+						return false;
+					}
+				}
+				if ($forField instanceof Field && $directOwner instanceof Page && $directOwner->id > 0) {
+					if (!self::isFieldViewableOnPage($forField, $directOwner)) {
+						return false;
+					}
+				}
+			}
+		}
+
 		return true;
+	}
+
+	/**
+	 * Enforce ProcessWire field-level RBAC (`$field->useRoles` / `$field->viewable($page)`).
+	 */
+	public static function isFieldViewableOnPage(Field $field, Page $page): bool
+	{
+		if (!(bool) $field->useRoles) {
+			return true;
+		}
+
+		return $field->viewable($page) || ($page->editable() && $field->editable($page));
 	}
 
 	public static function isUiFieldset(Field $field): bool

@@ -25,6 +25,7 @@ final class PageReferenceFieldDataProvider extends FieldDataProvider
 	{
 		return [
 			'FieldtypePage',
+			'FieldtypePageTable',
 		];
 	}
 

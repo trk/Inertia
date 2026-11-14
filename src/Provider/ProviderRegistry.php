@@ -246,7 +246,7 @@ final class ProviderRegistry extends Wire
 	public function transformField(Field $field, Page $page): mixed
 	{
 		$fieldName = trim((string) $field->name);
-		if ($fieldName === '') {
+		if ($fieldName === '' || !TemplateDataProvider::isFieldViewableOnPage($field, $page)) {
 			return null;
 		}
 
@@ -299,6 +299,15 @@ final class ProviderRegistry extends Wire
 	 */
 	public function providePage(Page $page): array
 	{
+		if ($page instanceof User) {
+			return $this->provideUser($page);
+		}
+
+		$currentPage = $this->wire()?->page;
+		if (!TemplateDataProvider::isAccessiblePage($page, true, $currentPage instanceof Page ? $currentPage : null)) {
+			return [];
+		}
+
 		$id = (int) $page->id;
 		if ($id > 0 && isset($this->activePageIds[$id])) {
 			return TemplateDataProvider::basePageData($page);
@@ -364,7 +373,7 @@ final class ProviderRegistry extends Wire
 	 */
 	public function mediaTsDefinitions(): array
 	{
-		$defaults = MediaFieldDataProvider::defaultTsDefinitions($this->wire() !== null ? MediaFieldDataProvider::isInterventionImageInstalled($this->wire()) : null);
+		$defaults = MediaFieldDataProvider::defaultTsDefinitions();
 		$targets = [
 			'FieldtypeImage' => 'InertiaImage',
 			'FieldtypeFile' => 'InertiaFile',

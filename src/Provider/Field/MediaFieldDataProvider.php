@@ -8,19 +8,15 @@ use ProcessWire\Field;
 use ProcessWire\Page;
 use ProcessWire\Pagefile;
 use ProcessWire\Pageimage;
-use ProcessWire\ProcessWire;
-use Throwable;
+use ProcessWire\User;
 use Totoglu\Inertia\Provider\FieldDataProvider;
-use function ProcessWire\wire;
+use Totoglu\Inertia\Provider\TemplateDataProvider;
 
 /**
  * Core FieldDataProvider for `FieldtypeImage` and `FieldtypeFile`.
  *
  * Normalizes single (`maxFiles === 1`) and multi-file/image fields consistently
- * regardless of `$page->of()` output formatting state, and automatically enriches
- * `Pageimage` payloads and TypeScript definitions with responsive `srcset`, `sizes`,
- * `sources`, `lqip`, `dominantColor`, `palette`, `colorTheme`, and `imageHash` metadata
- * when the `InterventionImage` module is installed.
+ * regardless of `$page->of()` output formatting state.
  */
 final class MediaFieldDataProvider extends FieldDataProvider
 {
@@ -81,33 +77,13 @@ final class MediaFieldDataProvider extends FieldDataProvider
 	}
 
 	/**
-	 * Determine whether the `InterventionImage` module is installed in ProcessWire.
-	 */
-	public static function isInterventionImageInstalled(?ProcessWire $wire = null): bool
-	{
-		try {
-			$wireInstance = $wire ?? wire();
-			if (!$wireInstance instanceof ProcessWire) {
-				return false;
-			}
-
-			return $wireInstance->modules->isInstalled('InterventionImage');
-		} catch (Throwable) {
-			return false;
-		}
-	}
-
-	/**
-	 * Canonical TypeScript interface definitions for `InertiaImage` (including `InterventionImage`
-	 * responsive/color/hash types when installed) and `InertiaFile`.
+	 * Canonical TypeScript interface definitions for `InertiaImage` and `InertiaFile`.
 	 *
 	 * @return array<string, string>
 	 */
-	public static function defaultTsDefinitions(?bool $withIntervention = null): array
+	public static function defaultTsDefinitions(): array
 	{
-		$useIntervention = $withIntervention ?? self::isInterventionImageInstalled();
-
-		$definitions = [
+		return [
 			'InertiaImageFocus' => <<<'TS'
 export interface InertiaImageFocus {
 	top: number;
@@ -115,48 +91,7 @@ export interface InertiaImageFocus {
 	zoom: number;
 }
 TS,
-		];
-
-		if ($useIntervention) {
-			$definitions['InertiaImageSource'] = <<<'TS'
-export interface InertiaImageSource {
-	type: string;
-	srcset: string;
-}
-TS;
-			$definitions['InertiaImageColorTheme'] = <<<'TS'
-export interface InertiaImageColorTheme {
-	vibrant: string | null;
-	muted: string | null;
-	darkVibrant: string | null;
-	darkMuted: string | null;
-	lightVibrant: string | null;
-	lightMuted: string | null;
-}
-TS;
-			$definitions['InertiaImage'] = <<<'TS'
-export interface InertiaImage {
-	name: string;
-	url: string;
-	httpUrl: string;
-	description: string;
-	ext: string;
-	filesize: number;
-	width: number;
-	height: number;
-	focus: InertiaImageFocus;
-	srcset: string;
-	sizes: string;
-	sources: InertiaImageSource[];
-	lqip: string;
-	dominantColor: string;
-	palette: string[];
-	colorTheme: InertiaImageColorTheme | null;
-	imageHash: string;
-}
-TS;
-		} else {
-			$definitions['InertiaImage'] = <<<'TS'
+			'InertiaImage' => <<<'TS'
 export interface InertiaImage {
 	name: string;
 	url: string;
@@ -168,10 +103,8 @@ export interface InertiaImage {
 	height: number;
 	focus: InertiaImageFocus;
 }
-TS;
-		}
-
-		$definitions['InertiaFile'] = <<<'TS'
+TS,
+			'InertiaFile' => <<<'TS'
 export interface InertiaFile {
 	name: string;
 	url: string;
@@ -180,9 +113,8 @@ export interface InertiaFile {
 	ext: string;
 	filesize: number;
 }
-TS;
-
-		return $definitions;
+TS,
+		];
 	}
 
 	/**
@@ -238,15 +170,70 @@ TS;
 
 	public static function isAccessiblePagefile(Pagefile $file): bool
 	{
-		return !$file->isTemp() && !$file->hidden();
+		if ($file->isTemp() || $file->hidden()) {
+			return false;
+		}
+
+		$ownerPage = $file->page;
+		if ($ownerPage instanceof Page && $ownerPage->id > 0) {
+			if ($file->field instanceof Field && !TemplateDataProvider::isFieldViewableOnPage($file->field, $ownerPage)) {
+				return false;
+			}
+
+			if ($ownerPage instanceof User) {
+				if ($ownerPage->isTrash() || $ownerPage->isUnpublished()) {
+					return false;
+				}
+				$viewer = $file->wire()?->user;
+				$isSelfOrAdmin = ($viewer instanceof User)
+					&& (
+						((int) $viewer->id === (int) $ownerPage->id)
+						|| $viewer->isSuperuser()
+						|| ($viewer->hasPermission('user-admin') && !$ownerPage->isSuperuser())
+					);
+				if ($isSelfOrAdmin) {
+					return true;
+				}
+
+				return $file->field instanceof Field
+					&& (bool) $file->field->useRoles
+					&& $file->field->viewable($ownerPage);
+			}
+
+			$currentPage = $file->wire()?->page;
+			$isCurrentAllowed = $currentPage instanceof Page && $currentPage->id > 0 && $currentPage->id === $ownerPage->id;
+			if (!TemplateDataProvider::isAccessiblePage($ownerPage, true, $currentPage instanceof Page ? $currentPage : null)) {
+				return false;
+			}
+
+			$hasAccessContext = $ownerPage->template instanceof \ProcessWire\Template && (
+				(int) $ownerPage->id === 1
+				|| (int) $ownerPage->parent_id > 0
+				|| (bool) $ownerPage->template->useRoles
+				|| ($ownerPage->hasField('process') && (bool) $ownerPage->get('process'))
+			);
+			if ($hasAccessContext && !$ownerPage->viewable($file) && !($isCurrentAllowed && $ownerPage->editable())) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	/**
-	 * Serialize a `Pageimage` into an `InertiaImage` associative array, enriching with
-	 * `InterventionImage` responsive (`srcset`, `sizes`, `sources`), `lqip`, `dominantColor`,
-	 * `palette`, `colorTheme`, and `imageHash` properties when `InterventionImage` is installed.
+	 * Serialize a `Pageimage` into a core `InertiaImage` associative array.
 	 *
-	 * @return array<string, mixed>
+	 * @return array{
+	 *     name: string,
+	 *     url: string,
+	 *     httpUrl: string,
+	 *     description: string,
+	 *     ext: string,
+	 *     filesize: int,
+	 *     width: int,
+	 *     height: int,
+	 *     focus: array{top: float, left: float, zoom: int}
+	 * }
 	 */
 	public static function formatPageimage(Pageimage $image): array
 	{
@@ -257,7 +244,7 @@ TS;
 			'zoom' => is_array($rawFocus) && isset($rawFocus['zoom']) ? (int) $rawFocus['zoom'] : 0,
 		];
 
-		$data = [
+		return [
 			'name' => (string) $image->name,
 			'url' => (string) $image->url,
 			'httpUrl' => (string) $image->httpUrl,
@@ -268,129 +255,6 @@ TS;
 			'height' => (int) $image->height,
 			'focus' => $focus,
 		];
-
-		$wire = $image->wire();
-		if (self::isInterventionImageInstalled($wire)) {
-			$data = array_merge($data, self::extractInterventionImageData($image));
-		}
-
-		return $data;
-	}
-
-	/**
-	 * Extract responsive attributes, LQIP, color metadata, and perceptual hash from `InterventionImage` hooks on `Pageimage`.
-	 *
-	 * @return array{
-	 *     srcset: string,
-	 *     sizes: string,
-	 *     sources: list<array{type: string, srcset: string}>,
-	 *     lqip: string,
-	 *     dominantColor: string,
-	 *     palette: list<string>,
-	 *     colorTheme: array{vibrant: string|null, muted: string|null, darkVibrant: string|null, darkMuted: string|null, lightVibrant: string|null, lightMuted: string|null}|null,
-	 *     imageHash: string
-	 * }
-	 */
-	private static function extractInterventionImageData(Pageimage $image): array
-	{
-		$result = [
-			'srcset' => '',
-			'sizes' => '',
-			'sources' => [],
-			'lqip' => '',
-			'dominantColor' => '',
-			'palette' => [],
-			'colorTheme' => null,
-			'imageHash' => '',
-		];
-
-		try {
-			$wire = $image->wire();
-			$wire->modules->get('InterventionImage');
-		} catch (Throwable) {
-			return $result;
-		}
-
-		$filename = (string) $image->filename;
-		if ($filename === '' || !is_file($filename) || filesize($filename) === 0) {
-			return $result;
-		}
-
-		try {
-			$rawAttrs = $image->attrs();
-			if (is_array($rawAttrs)) {
-				if (isset($rawAttrs['srcset']) && is_string($rawAttrs['srcset'])) {
-					$result['srcset'] = $rawAttrs['srcset'];
-				}
-				if (isset($rawAttrs['sizes']) && is_string($rawAttrs['sizes'])) {
-					$result['sizes'] = $rawAttrs['sizes'];
-				}
-				if (isset($rawAttrs['sources']) && is_array($rawAttrs['sources'])) {
-					$sources = [];
-					foreach ($rawAttrs['sources'] as $sourceItem) {
-						if (is_array($sourceItem) && isset($sourceItem['type'], $sourceItem['srcset'])) {
-							$type = trim((string) $sourceItem['type']);
-							$srcset = trim((string) $sourceItem['srcset']);
-							if ($type !== '' && $srcset !== '') {
-								$sources[] = [
-									'type' => $type,
-									'srcset' => $srcset,
-								];
-							}
-						}
-					}
-					$result['sources'] = $sources;
-				}
-			}
-		} catch (Throwable) {
-		}
-
-		try {
-			$rawLqip = $image->lqip();
-			if (is_string($rawLqip)) {
-				$result['lqip'] = $rawLqip;
-			}
-		} catch (Throwable) {
-		}
-
-		try {
-			// Call palette() first so InterventionImage caches dominant, palette, and theme in .colors.json in a single pass
-			$rawPalette = $image->palette(6, true);
-			if (is_array($rawPalette)) {
-				$result['palette'] = array_values(array_filter(
-					array_map(static fn(mixed $hex): string => is_string($hex) ? trim($hex) : '', $rawPalette),
-					static fn(string $hex): bool => $hex !== ''
-				));
-			}
-
-			$rawDominant = $image->dominantColor(true);
-			if (is_string($rawDominant)) {
-				$result['dominantColor'] = $rawDominant;
-			}
-
-			$rawTheme = $image->colorTheme(true);
-			if (is_array($rawTheme) && $rawTheme !== []) {
-				$result['colorTheme'] = [
-					'vibrant' => isset($rawTheme['vibrant']) && is_string($rawTheme['vibrant']) && $rawTheme['vibrant'] !== '' ? $rawTheme['vibrant'] : null,
-					'muted' => isset($rawTheme['muted']) && is_string($rawTheme['muted']) && $rawTheme['muted'] !== '' ? $rawTheme['muted'] : null,
-					'darkVibrant' => isset($rawTheme['darkVibrant']) && is_string($rawTheme['darkVibrant']) && $rawTheme['darkVibrant'] !== '' ? $rawTheme['darkVibrant'] : null,
-					'darkMuted' => isset($rawTheme['darkMuted']) && is_string($rawTheme['darkMuted']) && $rawTheme['darkMuted'] !== '' ? $rawTheme['darkMuted'] : null,
-					'lightVibrant' => isset($rawTheme['lightVibrant']) && is_string($rawTheme['lightVibrant']) && $rawTheme['lightVibrant'] !== '' ? $rawTheme['lightVibrant'] : null,
-					'lightMuted' => isset($rawTheme['lightMuted']) && is_string($rawTheme['lightMuted']) && $rawTheme['lightMuted'] !== '' ? $rawTheme['lightMuted'] : null,
-				];
-			}
-		} catch (Throwable) {
-		}
-
-		try {
-			$rawHash = $image->imageHash('dhash');
-			if (is_string($rawHash)) {
-				$result['imageHash'] = $rawHash;
-			}
-		} catch (Throwable) {
-		}
-
-		return $result;
 	}
 
 	/**

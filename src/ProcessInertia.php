@@ -13,4 +13,9 @@ use ProcessWire\Process;
 abstract class ProcessInertia extends Process
 {
 	use InteractWithInertia;
+
+	public function shouldValidateCsrf(): bool
+	{
+		return true;
+	}
 }

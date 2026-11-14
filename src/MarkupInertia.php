@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Totoglu\Inertia;
 
+use ProcessWire\Inertia;
 use ProcessWire\ModuleJS;
 use Totoglu\Inertia\Contracts\InertiaSerializable;
 
@@ -72,7 +73,7 @@ abstract class MarkupInertia extends ModuleJS implements InertiaSerializable
 			: [];
 
 		$safeComponent = $this->encodeHtmlAttribute($component);
-		$jsonProps = json_encode($resolvedProps, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+		$jsonProps = json_encode($resolvedProps, Inertia::JSON_HTML_SAFE_FLAGS);
 		$safeProps = $this->encodeHtmlAttribute(is_string($jsonProps) ? $jsonProps : '{}');
 
 		return "<div class=\"pw-inertia-island\" data-inertia-island=\"{$safeComponent}\" data-props=\"{$safeProps}\"></div>";

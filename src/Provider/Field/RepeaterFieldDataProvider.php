@@ -38,8 +38,10 @@ final class RepeaterFieldDataProvider extends FieldDataProvider
 		return [
 			'FieldtypeRepeater',
 			'FieldtypeRepeaterMatrix',
+			'FieldtypeFieldsetPage',
 			'ProcessWire\\RepeaterPage',
 			'ProcessWire\\RepeaterPageArray',
+			'ProcessWire\\FieldsetPage',
 		];
 	}
 
@@ -70,17 +72,23 @@ final class RepeaterFieldDataProvider extends FieldDataProvider
 
 	private static function isAccessibleRepeaterItem(Page $item): bool
 	{
-		return TemplateDataProvider::isAccessiblePage($item) && !$item->isHidden();
+		$currentPage = $item->wire()?->page;
+
+		return !$item->isHidden()
+			&& TemplateDataProvider::isAccessiblePage($item, true, $currentPage instanceof Page ? $currentPage : null);
 	}
 
 	public function phpType(Field $field): string
 	{
-		return 'PageArray';
+		return $this->isFieldsetPage($field) ? 'Page|NullPage' : 'PageArray';
 	}
 
 	public function tsType(Field $field): string
 	{
 		$repeaterTemplate = $this->resolveRepeaterTemplate($field);
+		if ($this->isFieldsetPage($field)) {
+			return $repeaterTemplate === null ? 'InertiaPageBase | null' : self::interfaceNameForField($field) . ' | null';
+		}
 		if ($repeaterTemplate === null) {
 			return 'InertiaPageBase[]';
 		}
@@ -175,6 +183,13 @@ final class RepeaterFieldDataProvider extends FieldDataProvider
 		}
 
 		return null;
+	}
+
+	private function isFieldsetPage(Field $field): bool
+	{
+		$typeClass = $field->type !== null ? $field->type->className() : '';
+
+		return str_contains($typeClass, 'FieldsetPage');
 	}
 
 	private function isRepeaterMatrix(Field $field): bool

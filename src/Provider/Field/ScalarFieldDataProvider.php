@@ -7,8 +7,10 @@ namespace Totoglu\Inertia\Provider\Field;
 use ProcessWire\Field;
 use ProcessWire\FieldtypeText;
 use ProcessWire\FieldtypeTextarea;
+use ProcessWire\LanguagesValueInterface;
 use ProcessWire\Page;
 use ProcessWire\Textformatter;
+use ProcessWire\Wire;
 use Stringable;
 use Totoglu\Inertia\Provider\FieldDataProvider;
 
@@ -65,6 +67,10 @@ final class ScalarFieldDataProvider extends FieldDataProvider
 
 		if ($typeClass === 'FieldtypeFloat' || $typeClass === 'FieldtypeDecimal') {
 			return $value !== null && $value !== '' ? (float) $value : 0.0;
+		}
+
+		if ($value instanceof Wire && !$value instanceof LanguagesValueInterface) {
+			return '';
 		}
 
 		if (is_scalar($value) || $value instanceof Stringable) {
@@ -195,12 +201,18 @@ final class ScalarFieldDataProvider extends FieldDataProvider
 		foreach ($selected as $formatterName) {
 			if (in_array($formatterName, self::ENTITY_ENCODER_FORMATTERS, true)) {
 				$fieldName = trim((string) $field->name);
-				$unformatted = $page !== null && $fieldName !== '' && $page->id > 0 && $page->of()
-					? $page->getUnformatted($fieldName)
-					: null;
+				if ($page !== null && $fieldName !== '' && $page->id > 0) {
+					if (!$page->of() && $page->template !== null && $page->hasField($fieldName)) {
+						$rawCurrent = $page->getUnformatted($fieldName);
+						if ((is_scalar($rawCurrent) || $rawCurrent instanceof Stringable) && (string) $rawCurrent === $formattedValue) {
+							return $formattedValue;
+						}
+					}
 
-				if ((is_scalar($unformatted) || $unformatted instanceof Stringable) && (string) $unformatted !== '' && (string) $unformatted !== $formattedValue) {
-					return (string) $unformatted;
+					$unformatted = $page->of() ? $page->getUnformatted($fieldName) : null;
+					if ((is_scalar($unformatted) || $unformatted instanceof Stringable) && (string) $unformatted !== '' && (string) $unformatted !== $formattedValue) {
+						return (string) $unformatted;
+					}
 				}
 
 				return html_entity_decode($formattedValue, ENT_QUOTES | ENT_HTML5, 'UTF-8');
