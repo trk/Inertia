@@ -49,6 +49,15 @@ final class TypeGenerator extends Wire
 		$templates = $this->resolveTargetTemplates($templateNames);
 		$resolvedNames = array_values(array_map(static fn(Template $t): string => (string) $t->name, $templates));
 
+		if ($this->inertia->request->isDemoMode()) {
+			return [
+				'templates' => $resolvedNames,
+				'phpClasses' => [],
+				'templateControllers' => [],
+				'typescript' => null,
+			];
+		}
+
 		$phpClasses = [];
 		$templateControllers = [];
 
@@ -172,6 +181,7 @@ final class TypeGenerator extends Wire
 	public function buildPageClassCode(Template $template): string
 	{
 		$tplName = (string) $template->name;
+		$safeDocTplName = str_replace('*/', '* /', $tplName);
 		$pascal = ProviderRegistry::studly($tplName);
 		$className = $pascal . 'Page';
 		$registry = $this->inertia->providers();
@@ -179,8 +189,9 @@ final class TypeGenerator extends Wire
 		$propertyLines = [];
 
 		foreach ($templateProvider->eligibleFields($template) as $fName => $field) {
-			$phpDocType = $registry->resolveFieldProvider($field)->phpType($field);
-			$propertyLines[] = " * @property {$phpDocType} \${$fName}";
+			$phpDocType = str_replace('*/', '* /', $registry->resolveFieldProvider($field)->phpType($field));
+			$safeFieldName = str_replace('*/', '* /', (string) $fName);
+			$propertyLines[] = " * @property {$phpDocType} \${$safeFieldName}";
 		}
 
 		if ($propertyLines === []) {
@@ -199,7 +210,7 @@ namespace ProcessWire;
 use Totoglu\Inertia\InteractWithInertia;
 
 /**
- * Custom Page Class for the `{$tplName}` template.
+ * Custom Page Class for the `{$safeDocTplName}` template.
  *
 {$propertiesDoc}
  */
@@ -416,7 +427,8 @@ TS;
 		$templatesPath = rtrim((string) $config->paths->templates, '/\\');
 		$defaultOutput = $templatesPath . '/assets/js/types/inertia.d.ts';
 
-		$rawPath = $customOutputPath !== null && trim($customOutputPath) !== ''
+		$hasExplicitCustomPath = $customOutputPath !== null && trim($customOutputPath) !== '';
+		$rawPath = $hasExplicitCustomPath
 			? trim($customOutputPath)
 			: trim((string) $this->inertia->typeScriptOutputPath);
 
@@ -435,24 +447,52 @@ TS;
 			return $defaultOutput;
 		}
 
-		if (str_starts_with($rawPath, '/') || preg_match('/^[A-Za-z]:[\\\\\/]/', $rawPath) === 1) {
-			$sitePath = rtrim(str_replace('\\', '/', (string) $config->paths->site), '/');
-			$tempDir = rtrim(str_replace('\\', '/', sys_get_temp_dir()), '/');
-			$realTempDir = realpath(sys_get_temp_dir());
-			$realTempNormalized = $realTempDir !== false ? rtrim(str_replace('\\', '/', $realTempDir), '/') : '';
+		$sitePath = rtrim(str_replace('\\', '/', (string) $config->paths->site), '/');
+		$realSite = $sitePath !== '' ? realpath($sitePath) : false;
+		$realSitePrefix = is_string($realSite) ? rtrim(str_replace('\\', '/', $realSite), '/') . '/' : '';
+		$tempDir = $hasExplicitCustomPath ? rtrim(str_replace('\\', '/', sys_get_temp_dir()), '/') : '';
+		$realTempDir = $hasExplicitCustomPath ? realpath(sys_get_temp_dir()) : false;
+		$realTempPrefix = is_string($realTempDir) ? rtrim(str_replace('\\', '/', $realTempDir), '/') . '/' : '';
 
-			$inSite = $sitePath !== '' && str_starts_with($normalized, $sitePath . '/');
+		if (str_starts_with($rawPath, '/') || preg_match('/^[A-Za-z]:[\\\\\/]/', $rawPath) === 1) {
+			$inSite = ($sitePath !== '' && str_starts_with($normalized, $sitePath . '/'))
+				|| ($realSitePrefix !== '' && str_starts_with($normalized, $realSitePrefix));
 			$inTemp = ($tempDir !== '' && str_starts_with($normalized, $tempDir . '/'))
-				|| ($realTempNormalized !== '' && str_starts_with($normalized, $realTempNormalized . '/'));
+				|| ($realTempPrefix !== '' && str_starts_with($normalized, $realTempPrefix));
 
 			if (!$inSite && !$inTemp) {
 				return $defaultOutput;
 			}
 
-			return $rawPath;
+			$candidate = $rawPath;
+		} else {
+			$candidate = $templatesPath . '/' . ltrim($rawPath, '/\\');
 		}
 
-		return $templatesPath . '/' . ltrim($rawPath, '/\\');
+		if (is_link($candidate)) {
+			return $defaultOutput;
+		}
+
+		$probe = $candidate;
+		while ($probe !== '' && !file_exists($probe)) {
+			$parent = dirname($probe);
+			if ($parent === $probe) {
+				break;
+			}
+			$probe = $parent;
+		}
+
+		$realProbe = $probe !== '' ? realpath($probe) : false;
+		if (is_string($realProbe)) {
+			$realProbeSlash = rtrim(str_replace('\\', '/', $realProbe), '/') . '/';
+			$allowedReal = ($realSitePrefix !== '' && str_starts_with($realProbeSlash, $realSitePrefix))
+				|| ($realTempPrefix !== '' && str_starts_with($realProbeSlash, $realTempPrefix));
+			if (!$allowedReal) {
+				return $defaultOutput;
+			}
+		}
+
+		return $candidate;
 	}
 
 	/**
@@ -463,26 +503,46 @@ TS;
 	 */
 	public function writeScaffoldFile(string $filePath, string|callable $content, bool $force = false): string
 	{
+		if ($this->inertia->request->isDemoMode() || is_link($filePath)) {
+			return 'skipped';
+		}
+
 		$existed = is_file($filePath);
 		if ($existed && !$force) {
 			return 'skipped';
 		}
 
 		$resolvedContent = is_string($content) ? $content : (string) $content();
-		$this->writeFileSafely($filePath, $resolvedContent);
+		$written = $this->writeFileSafely($filePath, $resolvedContent);
+
+		if (!$written) {
+			return 'skipped';
+		}
 
 		return $existed ? 'updated' : 'created';
 	}
 
 	public function writeFileSafely(string $filePath, string $content): bool
 	{
+		if ($this->inertia->request->isDemoMode() || is_link($filePath)) {
+			return false;
+		}
+
 		$dir = dirname($filePath);
+		if (is_link($dir)) {
+			return false;
+		}
+
 		$files = $this->wire()->files;
 
 		if (!is_dir($dir)) {
 			$files->mkdir($dir, true);
 		}
 
-		return (bool) $files->filePutContents($filePath, $content);
+		if (is_link($dir) || is_link($filePath)) {
+			return false;
+		}
+
+		return (bool) $files->filePutContents($filePath, $content, LOCK_EX);
 	}
 }

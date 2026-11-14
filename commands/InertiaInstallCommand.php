@@ -6,6 +6,7 @@ namespace Totoglu\Inertia\Commands;
 
 use Laravel\Prompts\Prompt;
 use ProcessWire\Inertia;
+use ProcessWire\ProcessWire;
 use ProcessWire\Template;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -17,10 +18,13 @@ use Totoglu\Inertia\Support\TypeGenerator;
 use function Laravel\Prompts\error;
 use function Laravel\Prompts\info;
 use function Laravel\Prompts\table;
-use function ProcessWire\wire;
 
 final class InertiaInstallCommand extends Command
 {
+	private function wire(): ProcessWire
+	{
+		return Inertia::instance()->wire();
+	}
 	protected function configure(): void
 	{
 		$this
@@ -38,6 +42,26 @@ final class InertiaInstallCommand extends Command
 
 		$force = (bool) $input->getOption('force');
 		$asJson = (bool) $input->getOption('json');
+
+		$wire = $this->wire();
+		if ((bool) $wire->config->demo) {
+			$msg = 'Write operations are disabled in demo mode.';
+			if ($asJson) {
+				$output->writeln((string) json_encode([
+					'ok' => false,
+					'error' => [
+						'code' => 'DEMO_MODE',
+						'message' => $msg,
+					],
+				], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+				return Command::FAILURE;
+			}
+
+			error($msg);
+
+			return Command::FAILURE;
+		}
 
 		$stackRaw = strtolower(trim((string) $input->getOption('stack')));
 		if (!in_array($stackRaw, ['vue', 'react', 'svelte'], true)) {
@@ -64,8 +88,7 @@ final class InertiaInstallCommand extends Command
 			$templateName = 'inertia';
 		}
 
-		$wire = wire();
-		$inertia = Inertia::instance();
+		$inertia = Inertia::instance($wire);
 		$typeGenerator = $inertia->typeGenerator();
 		$config = $wire->config;
 		$modules = $wire->modules;
