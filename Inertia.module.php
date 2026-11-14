@@ -155,7 +155,7 @@ class Inertia extends WireData implements Module, ConfigurableModule
 	{
 		return [
 			'title' => __('Inertia', __FILE__),
-			'version' => 12,
+			'version' => 13,
 			'summary' => __('Standalone Inertia.js v3 server-side protocol adapter for ProcessWire with Deferred/Merge/Once/Scroll props, Vite versioning, and fault-tolerant SSR.', __FILE__),
 			'href' => 'https://github.com/trk/Inertia',
 			'author' => 'Iskender TOTOGLU @trk @ukyo',
