@@ -12,19 +12,23 @@ use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
+use Totoglu\Console\Traits\InteractWithProcessWire;
 use Totoglu\Inertia\Provider\ProviderRegistry;
+use Totoglu\Inertia\Support\TemplateMode;
 use Totoglu\Inertia\Support\TypeGenerator;
 
-use function Laravel\Prompts\error;
 use function Laravel\Prompts\info;
 use function Laravel\Prompts\table;
 
 final class InertiaInstallCommand extends Command
 {
+	use InteractWithProcessWire;
+
 	private function wire(): ProcessWire
 	{
 		return Inertia::instance()->wire();
 	}
+
 	protected function configure(): void
 	{
 		$this
@@ -32,6 +36,7 @@ final class InertiaInstallCommand extends Command
 			->setDescription('Publish the Inertia.js v3 Root View (_inertia.php), Vite entry (inertia.ts), starter SPA page component, Custom Page Class, and TypeScript definitions.')
 			->addOption('stack', 's', InputOption::VALUE_REQUIRED, 'Frontend framework stack: vue, react, or svelte', 'vue')
 			->addOption('template', 't', InputOption::VALUE_REQUIRED, 'ProcessWire template to enable and scaffold', 'inertia')
+			->addOption('dry-run', null, InputOption::VALUE_NONE, 'Preview planned file and configuration changes without writing to disk')
 			->addOption('force', 'f', InputOption::VALUE_NONE, 'Overwrite existing starter files')
 			->addOption('json', null, InputOption::VALUE_NONE, 'Output results as structured JSON');
 	}
@@ -41,65 +46,54 @@ final class InertiaInstallCommand extends Command
 		Prompt::setOutput($output);
 
 		$force = (bool) $input->getOption('force');
+		$dryRun = (bool) $input->getOption('dry-run');
 		$asJson = (bool) $input->getOption('json');
 
 		$wire = $this->wire();
 		if ((bool) $wire->config->demo) {
-			$msg = 'Write operations are disabled in demo mode.';
-			if ($asJson) {
-				$output->writeln((string) json_encode([
-					'ok' => false,
-					'error' => [
-						'code' => 'DEMO_MODE',
-						'message' => $msg,
-					],
-				], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-
-				return Command::FAILURE;
-			}
-
-			error($msg);
-
-			return Command::FAILURE;
+			return $this->failCommand($output, $asJson, 'DEMO_MODE', 'Write operations are disabled in demo mode.');
 		}
 
 		$stackRaw = strtolower(trim((string) $input->getOption('stack')));
 		if (!in_array($stackRaw, ['vue', 'react', 'svelte'], true)) {
-			$msg = "Unsupported stack '{$stackRaw}'. Allowed values: vue, react, svelte.";
-			if ($asJson) {
-				$output->writeln((string) json_encode([
-					'ok' => false,
-					'error' => [
-						'code' => 'INVALID_STACK',
-						'message' => $msg,
-					],
-				], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-
-				return Command::FAILURE;
-			}
-
-			error($msg);
-
-			return Command::FAILURE;
-		}
-
-		$templateName = (string) preg_replace('/[^a-zA-Z0-9_-]/', '', trim((string) $input->getOption('template')));
-		if ($templateName === '' || $templateName === 'admin') {
-			$templateName = 'inertia';
+			return $this->failCommand(
+				$output,
+				$asJson,
+				'INVALID_STACK',
+				"Unsupported stack '{$stackRaw}'. Allowed values: vue, react, svelte."
+			);
 		}
 
 		$inertia = Inertia::instance($wire);
 		$typeGenerator = $inertia->typeGenerator();
 		$config = $wire->config;
 		$modules = $wire->modules;
-		$templates = $wire->templates;
+
+		$rawTemplate = trim((string) $input->getOption('template'));
+		$validatedTpl = $typeGenerator->validateTargetTemplateName($rawTemplate, false);
+		if (!$validatedTpl['ok']) {
+			return $this->failCommand(
+				$output,
+				$asJson,
+				'INVALID_TEMPLATE',
+				$validatedTpl['error']
+			);
+		}
+		$templateName = $validatedTpl['name'];
+		$tplObj = $validatedTpl['template'];
 
 		$templatesPath = rtrim((string) $config->paths->templates, '/\\');
+		$wasAllMode = TemplateMode::tryFrom((string) $inertia->mode) === TemplateMode::All;
+		$preInstallEnabled = $inertia->normalizeTemplateList($inertia->enabledTemplates);
 
-		// 1. Enable template in Inertia instance
-		$tplObj = $templates->get($templateName);
-		if ($tplObj instanceof Template) {
-			$inertia->forTemplates($templateName, true);
+		// 1. Enable template in Inertia instance while preserving Full SPA ('all') mode when active
+		if (!$dryRun && $tplObj instanceof Template) {
+			if ($wasAllMode) {
+				$inertia->forAllTemplates(true);
+				$inertia->set('enabledTemplates', array_values(array_unique(array_merge($preInstallEnabled, [$templateName]))));
+			} else {
+				$inertia->forTemplates($templateName, true);
+			}
 		}
 
 		$filesReport = [];
@@ -112,7 +106,8 @@ final class InertiaInstallCommand extends Command
 			$rootViewDest,
 			is_file($rootViewStub) ? (string) file_get_contents($rootViewStub) : '',
 			$force,
-			'Root View (_inertia.php)'
+			'Root View (_inertia.php)',
+			$dryRun
 		);
 
 		// 3. Publish site/templates/assets/js/inertia.ts
@@ -122,7 +117,8 @@ final class InertiaInstallCommand extends Command
 			$entryFile,
 			$this->buildEntryPointCode($stackRaw),
 			$force,
-			'Vite Inertia Entry (assets/js/inertia.ts)'
+			'Vite Inertia Entry (assets/js/inertia.ts)',
+			$dryRun
 		);
 
 		// 4. Scaffold starter frontend component (e.g. Pages/Inertia/Show.vue)
@@ -138,47 +134,78 @@ final class InertiaInstallCommand extends Command
 			$componentPath,
 			$this->buildStarterComponentCode($stackRaw, $pascal),
 			$force,
-			"Starter Component (Pages/{$pascal}/Show.{$ext})"
+			"Starter Component (Pages/{$pascal}/Show.{$ext})",
+			$dryRun
 		);
 
 		// 5. Register assets/js/inertia.ts in site/templates/vite.config.js if present
 		$viteConfigPath = $templatesPath . '/vite.config.js';
-		if (is_file($viteConfigPath)) {
-			$filesReport[] = $this->patchViteConfig($typeGenerator, $viteConfigPath, $stackRaw);
+		if (!is_link($viteConfigPath) && is_file($viteConfigPath)) {
+			$filesReport[] = $this->patchViteConfig($typeGenerator, $viteConfigPath, $stackRaw, $dryRun);
 		}
 
 		// 6. Persist enabledTemplates in Inertia module configuration
-		if ($tplObj instanceof Template && $modules->isInstalled('Inertia')) {
-			$savedConfig = $modules->getConfig('Inertia');
-			$existingEnabled = is_array($savedConfig['enabledTemplates'] ?? null) ? $savedConfig['enabledTemplates'] : [];
-			if (!in_array($templateName, $existingEnabled, true)) {
-				$existingEnabled[] = $templateName;
-			}
-			$savedConfig['enabledTemplates'] = array_values(array_unique($existingEnabled));
+		if (!$dryRun && $tplObj instanceof Template && $modules->isInstalled('Inertia')) {
+			$rawSavedConfig = $modules->getConfig('Inertia');
+			$savedConfig = is_array($rawSavedConfig) ? $rawSavedConfig : [];
+			$savedEnabled = is_array($savedConfig['enabledTemplates'] ?? null) ? $savedConfig['enabledTemplates'] : [];
+			$mergedEnabled = array_values(array_unique(array_merge(
+				$preInstallEnabled,
+				$inertia->normalizeTemplateList($savedEnabled),
+				[$templateName]
+			)));
+			$savedConfig['enabledTemplates'] = $mergedEnabled;
 			$modules->saveConfig('Inertia', $savedConfig);
 		}
 
-		// 7. Run TypeGenerator for Custom Page Class, Template Controller, and inertia.d.ts
-		$typeGenResult = $typeGenerator->generate(
+		// 7. Run TypeGenerator: scaffold Page Class + Controller for $templateName, and build inertia.d.ts for all enabled templates + $templateName
+		$phpAndCtrlResult = $typeGenerator->generate(
 			templateNames: [$templateName],
 			force: $force,
 			generatePhp: true,
-			generateTs: true,
-			generateControllers: true
+			generateTs: false,
+			generateControllers: true,
+			dryRun: $dryRun,
+			allowUncreatedTemplates: true
 		);
+		$allModeTemplates = [];
+		if ($wasAllMode) {
+			foreach ($wire->templates as $candidateTpl) {
+				if ($candidateTpl instanceof Template && $inertia->isTemplateEnabled($candidateTpl)) {
+					$allModeTemplates[] = (string) $candidateTpl->name;
+				}
+			}
+		}
+		$allTsTemplates = array_values(array_unique(array_merge(
+			$allModeTemplates,
+			$preInstallEnabled,
+			$inertia->normalizeTemplateList($inertia->enabledTemplates),
+			[$templateName]
+		)));
+		$tsOnlyResult = $typeGenerator->generate(
+			templateNames: $allTsTemplates,
+			force: false,
+			generatePhp: false,
+			generateTs: true,
+			generateControllers: false,
+			dryRun: $dryRun,
+			allowUncreatedTemplates: true
+		);
+		$typeGenResult = [
+			'templates' => $tsOnlyResult['templates'],
+			'phpClasses' => $phpAndCtrlResult['phpClasses'],
+			'templateControllers' => $phpAndCtrlResult['templateControllers'],
+			'typescript' => $tsOnlyResult['typescript'],
+		];
 
 		if ($asJson) {
-			$output->writeln((string) json_encode([
-				'ok' => true,
-				'data' => [
-					'stack' => $stackRaw,
-					'template' => $templateName,
-					'files' => $filesReport,
-					'types' => $typeGenResult,
-				],
-			], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-
-			return Command::SUCCESS;
+			return $this->outputJsonSuccess($output, [
+				'stack' => $stackRaw,
+				'template' => $templateName,
+				'dryRun' => $dryRun,
+				'files' => $filesReport,
+				'types' => $typeGenResult,
+			]);
 		}
 
 		$rows = [];
@@ -192,11 +219,15 @@ final class InertiaInstallCommand extends Command
 			$rows[] = ["Template Controller ({$ctrl['template']}.php)", $ctrl['path'], strtoupper($ctrl['status'])];
 		}
 		if (is_array($typeGenResult['typescript'])) {
-			$rows[] = ['TypeScript Definitions', $typeGenResult['typescript']['path'], 'WRITTEN'];
+			$tsStatus = $dryRun ? 'WOULD_WRITE' : ($typeGenResult['typescript']['written'] ? 'WRITTEN' : 'SKIPPED');
+			$rows[] = ['TypeScript Definitions', $typeGenResult['typescript']['path'], $tsStatus];
 		}
 
 		table(['Artifact', 'Path', 'Status'], $rows);
-		info("Inertia.js v3 ({$stackRaw}) scaffolding completed for template '{$templateName}'.");
+		info($dryRun
+			? "Dry-run preview completed for Inertia.js v3 ({$stackRaw}) template '{$templateName}'."
+			: "Inertia.js v3 ({$stackRaw}) scaffolding completed for template '{$templateName}'."
+		);
 
 		return Command::SUCCESS;
 	}
@@ -209,43 +240,62 @@ final class InertiaInstallCommand extends Command
 		string $destPath,
 		string $content,
 		bool $force,
-		string $label
+		string $label,
+		bool $dryRun = false
 	): array {
 		return [
 			'label' => $label,
 			'path' => $destPath,
-			'status' => $typeGenerator->writeScaffoldFile($destPath, $content, $force),
+			'status' => $typeGenerator->writeScaffoldFile($destPath, $content, $force, $dryRun),
 		];
 	}
 
 	/**
-	 * Ensure `assets/js/inertia.ts` (and `@vitejs/plugin-vue` when stack is `vue`) is registered in `vite.config.js`.
+	 * Ensure `assets/js/inertia.ts` and the selected framework Vite plugin are registered in `vite.config.js`.
 	 *
 	 * @return array{label: string, path: string, status: string}
 	 */
-	private function patchViteConfig(TypeGenerator $typeGenerator, string $viteConfigPath, string $stack): array
+	private function patchViteConfig(TypeGenerator $typeGenerator, string $viteConfigPath, string $stack, bool $dryRun = false): array
 	{
 		$original = (string) file_get_contents($viteConfigPath);
 		$updated = $original;
 
 		if (!str_contains($updated, 'assets/js/inertia.ts')) {
-			$updated = str_replace(
-				'input: ["assets/css/app.css", "assets/js/app.js"]',
-				'input: ["assets/css/app.css", "assets/js/app.js", "assets/js/inertia.ts"]',
-				$updated
+			$updated = (string) preg_replace_callback(
+				'/(input\s*:\s*\[)([^\]]*)(\])/',
+				static function (array $m): string {
+					$inner = rtrim($m[2]);
+					if (trim($inner) === '') {
+						return $m[1] . '"assets/js/inertia.ts"' . $m[3];
+					}
+					$innerNoTrailingComma = rtrim($inner, ", \t\r\n");
+
+					return $m[1] . $innerNoTrailingComma . ', "assets/js/inertia.ts"' . $m[3];
+				},
+				$updated,
+				1
 			);
 		}
 
-		if ($stack === 'vue' && !str_contains($updated, '@vitejs/plugin-vue')) {
-			$updated = str_replace(
-				'import tailwindcss from "@tailwindcss/vite";',
-				"import tailwindcss from \"@tailwindcss/vite\";\nimport vue from \"@vitejs/plugin-vue\";",
-				$updated
-			);
-			$updated = str_replace(
-				"plugins: [\n\t\t\ttailwindcss(),",
-				"plugins: [\n\t\t\tvue(),\n\t\t\ttailwindcss(),",
-				$updated
+		[$pluginPkg, $pluginImport, $pluginCall] = match ($stack) {
+			'react' => ['@vitejs/plugin-react', 'import react from "@vitejs/plugin-react";', 'react()'],
+			'svelte' => ['@sveltejs/vite-plugin-svelte', 'import { svelte } from "@sveltejs/vite-plugin-svelte";', 'svelte()'],
+			default => ['@vitejs/plugin-vue', 'import vue from "@vitejs/plugin-vue";', 'vue()'],
+		};
+
+		if (!str_contains($updated, $pluginPkg) && preg_match('/plugins\s*:\s*\[/', $updated) === 1) {
+			if (preg_match_all('/^import\s+[^\r\n]+;?[ \t]*$/m', $updated, $importMatches, PREG_OFFSET_CAPTURE) > 0 && $importMatches[0] !== []) {
+				$lastImport = $importMatches[0][count($importMatches[0]) - 1];
+				$insertPos = $lastImport[1] + strlen($lastImport[0]);
+				$updated = substr($updated, 0, $insertPos) . "\n" . $pluginImport . substr($updated, $insertPos);
+			} else {
+				$updated = $pluginImport . "\n" . $updated;
+			}
+			$updated = (string) preg_replace(
+				'/(plugins\s*:\s*\[\s*)/',
+				"$1{$pluginCall},\n\t\t\t",
+				$updated,
+				1
 			);
 		}
 
@@ -257,12 +307,20 @@ final class InertiaInstallCommand extends Command
 			];
 		}
 
-		$typeGenerator->writeFileSafely($viteConfigPath, $updated);
+		if ($dryRun) {
+			return [
+				'label' => 'Vite Config (vite.config.js)',
+				'path' => $viteConfigPath,
+				'status' => 'would_update',
+			];
+		}
+
+		$wroteVite = $typeGenerator->writeFileSafely($viteConfigPath, $updated);
 
 		return [
 			'label' => 'Vite Config (vite.config.js)',
 			'path' => $viteConfigPath,
-			'status' => 'updated',
+			'status' => $wroteVite ? 'updated' : 'skipped',
 		];
 	}
 
@@ -270,10 +328,10 @@ final class InertiaInstallCommand extends Command
 	{
 		[$imports, $ext, $globType, $setup] = match ($stack) {
 			'react' => [
-				"import { createInertiaApp } from \"@inertiajs/react\";\nimport { createRoot } from \"react-dom/client\";",
+				"import { createElement } from \"react\";\nimport { createInertiaApp } from \"@inertiajs/react\";\nimport { createRoot } from \"react-dom/client\";",
 				'tsx',
 				'',
-				"setup({ el, App, props }) {\n\t\tcreateRoot(el).render(<App {...props} />);\n\t},",
+				"setup({ el, App, props }) {\n\t\tcreateRoot(el).render(createElement(App, props));\n\t},",
 			],
 			'svelte' => [
 				"import { createInertiaApp } from \"@inertiajs/svelte\";\nimport { mount } from \"svelte\";",
@@ -330,7 +388,7 @@ export default function Show({ page, children }: InertiaPageProps<{$interfaceNam
 						{page.title}
 					</h1>
 				</header>
-				<Deferred data="children" fallback={<p className="mt-8 text-sm text-gray-500">Loading child pages...</p>}>
+				<Deferred data="children" fallback={<p className="mt-8 text-sm text-gray-600 dark:text-neutral-300">Loading child pages...</p>}>
 					{children && children.length > 0 && (
 						<section className="mt-10 pt-8 border-t border-gray-200 dark:border-neutral-700">
 							<h2 className="text-lg font-semibold mb-4">Subpages</h2>
@@ -365,8 +423,19 @@ TSX;
 	let { page, children = [] }: InertiaPageProps<{$interfaceName}> = \$props();
 </script>
 
+<svelte:head>
+	<title>{page.title}</title>
+</svelte:head>
+
 <main class="max-w-4xl mx-auto py-12 px-4 sm:px-6 lg:px-8">
 	<h1 class="text-3xl font-bold">{page.title}</h1>
+	{#if children && children.length > 0}
+		<ul class="mt-8 grid sm:grid-cols-2 gap-4">
+			{#each children as child (child.id)}
+				<li><a href={child.url}>{child.title}</a></li>
+			{/each}
+		</ul>
+	{/if}
 </main>
 
 SVELTE;
@@ -410,7 +479,7 @@ defineProps<{
 
 			<Deferred data="children">
 				<template #fallback>
-					<div class="mt-8 p-6 rounded-xl border border-dashed border-gray-300 text-sm text-gray-500 dark:border-neutral-700 dark:text-neutral-400">
+					<div class="mt-8 p-6 rounded-xl border border-dashed border-gray-300 text-sm text-gray-600 dark:border-neutral-700 dark:text-neutral-300">
 						Loading child pages...
 					</div>
 				</template>
@@ -430,7 +499,7 @@ defineProps<{
 							<h3 class="font-semibold text-gray-900 group-hover:text-blue-600 dark:text-white dark:group-hover:text-blue-400">
 								{{ child.title }}
 							</h3>
-							<span class="mt-1 block text-xs text-gray-500 dark:text-neutral-400">
+							<span class="mt-1 block text-xs text-gray-600 dark:text-neutral-300">
 								{{ child.url }}
 							</span>
 						</Link>

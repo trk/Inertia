@@ -17,12 +17,12 @@ if (!defined('PROCESSWIRE')) {
  * @var Inertia $inertia
  * @var Sanitizer $sanitizer
  * @var array<string, mixed> $pageObject
- * @var string|null $locale
- * @var string|null $head
+ * @var string $locale
+ * @var string $head
  */
 ?>
 <!DOCTYPE html>
-<html lang="<?= $sanitizer->entities((string) ($locale ?? 'en')) ?>" class="h-full">
+<html lang="<?= $sanitizer->entities(($locale ?? '') !== '' ? (string) $locale : 'en') ?>" class="h-full">
 
 <head>
 	<meta charset="utf-8" />
@@ -39,7 +39,7 @@ if (!defined('PROCESSWIRE')) {
 </head>
 
 <body class="min-h-full antialiased">
-	<?= $inertia->app($pageObject) ?>
+	<?= $inertia->app($pageObject ?? null) ?>
 </body>
 
 </html>

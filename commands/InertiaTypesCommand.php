@@ -11,18 +11,21 @@ use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
+use Totoglu\Console\Traits\InteractWithProcessWire;
 
-use function Laravel\Prompts\error;
 use function Laravel\Prompts\info;
 use function Laravel\Prompts\table;
 use function Laravel\Prompts\warning;
 
 final class InertiaTypesCommand extends Command
 {
+	use InteractWithProcessWire;
+
 	private function wire(): ProcessWire
 	{
 		return Inertia::instance()->wire();
 	}
+
 	protected function configure(): void
 	{
 		$this
@@ -30,6 +33,7 @@ final class InertiaTypesCommand extends Command
 			->setDescription('Generate strongly-typed PHP Custom Page Classes (site/classes/*Page.php) and TypeScript definitions (inertia.d.ts) for Inertia templates.')
 			->addOption('template', 't', InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY, 'Target template name(s) (comma-separated or repeated)')
 			->addOption('output', 'o', InputOption::VALUE_REQUIRED, 'Custom output path for TypeScript definitions (inertia.d.ts)')
+			->addOption('dry-run', null, InputOption::VALUE_NONE, 'Preview generated classes and TypeScript output without writing to disk')
 			->addOption('force', 'f', InputOption::VALUE_NONE, 'Overwrite existing PHP Custom Page Classes and template controllers')
 			->addOption('ts-only', null, InputOption::VALUE_NONE, 'Generate only TypeScript (.d.ts) definitions')
 			->addOption('php-only', null, InputOption::VALUE_NONE, 'Generate only PHP Custom Page Classes')
@@ -44,54 +48,89 @@ final class InertiaTypesCommand extends Command
 		$wire = $this->wire();
 		$asJson = (bool) $input->getOption('json');
 		if ((bool) $wire->config->demo) {
-			$msg = 'Write operations are disabled in demo mode.';
-			if ($asJson) {
-				$output->writeln((string) json_encode([
-					'ok' => false,
-					'error' => [
-						'code' => 'DEMO_MODE',
-						'message' => $msg,
-					],
-				], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-
-				return Command::FAILURE;
-			}
-
-			error($msg);
-
-			return Command::FAILURE;
+			return $this->failCommand($output, $asJson, 'DEMO_MODE', 'Write operations are disabled in demo mode.');
 		}
 
 		$inertia = Inertia::instance($wire);
-		$rawTemplates = $input->getOption('template');
-		$templateNames = $inertia->normalizeTemplateList($rawTemplates);
+		$typeGenerator = $inertia->typeGenerator();
 
 		$force = (bool) $input->getOption('force');
+		$dryRun = (bool) $input->getOption('dry-run');
 		$tsOnly = (bool) $input->getOption('ts-only');
 		$phpOnly = (bool) $input->getOption('php-only');
 		$controllers = (bool) $input->getOption('controllers');
+
+		if ($tsOnly && $phpOnly) {
+			return $this->failCommand(
+				$output,
+				$asJson,
+				'INVALID_OPTIONS',
+				'Options --ts-only and --php-only cannot be combined.'
+			);
+		}
+
 		$outputOpt = $input->getOption('output');
-		$customOutput = is_string($outputOpt) && trim($outputOpt) !== '' ? trim($outputOpt) : null;
+		$customOutput = null;
+		if ($outputOpt !== null) {
+			$trimmedOutput = is_string($outputOpt) ? trim($outputOpt) : '';
+			if ($trimmedOutput === '' || !$typeGenerator->isValidCustomOutputPath($trimmedOutput)) {
+				return $this->failCommand(
+					$output,
+					$asJson,
+					'INVALID_OUTPUT_PATH',
+					'Invalid --output path. Must be a non-symlinked .ts file confined inside site/ or the system temp directory.'
+				);
+			}
+			$customOutput = $trimmedOutput;
+		}
+
+		$rawTemplates = $input->getOption('template');
+		$explicitTemplates = null;
+		if (is_array($rawTemplates) && $rawTemplates !== []) {
+			$parsedNames = [];
+			foreach ($rawTemplates as $rawEntry) {
+				if (!is_scalar($rawEntry)) {
+					continue;
+				}
+				foreach (explode(',', (string) $rawEntry) as $piece) {
+					$parsedNames[] = trim($piece);
+				}
+			}
+
+			$validatedNames = [];
+			foreach ($parsedNames as $candidateName) {
+				$validatedTpl = $typeGenerator->validateTargetTemplateName($candidateName, true);
+				if (!$validatedTpl['ok']) {
+					return $this->failCommand(
+						$output,
+						$asJson,
+						'INVALID_TEMPLATE',
+						$validatedTpl['error']
+					);
+				}
+
+				$validatedNames[] = $validatedTpl['name'];
+			}
+
+			$explicitTemplates = array_values(array_unique($validatedNames));
+		}
 
 		$generatePhp = !$tsOnly;
 		$generateTs = !$phpOnly;
 
-		$result = $inertia->typeGenerator()->generate(
-			$templateNames !== [] ? $templateNames : null,
+		$result = $typeGenerator->generate(
+			$explicitTemplates,
 			$force,
 			$generatePhp,
 			$generateTs,
 			$controllers,
-			$customOutput
+			$customOutput,
+			$dryRun
 		);
+		$result['dryRun'] = $dryRun;
 
 		if ($asJson) {
-			$output->writeln((string) json_encode([
-				'ok' => true,
-				'data' => $result,
-			], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-
-			return Command::SUCCESS;
+			return $this->outputJsonSuccess($output, $result);
 		}
 
 		if ($result['templates'] === []) {
@@ -125,8 +164,13 @@ final class InertiaTypesCommand extends Command
 
 		if (is_array($result['typescript'])) {
 			$ts = $result['typescript'];
+			$template = $dryRun
+				? 'Dry-run preview: TypeScript definitions would be written to %s (%d bytes, %d interfaces).'
+				: ($ts['written']
+					? 'TypeScript definitions written to %s (%d bytes, %d interfaces).'
+					: 'TypeScript definitions skipped for %s (%d bytes, %d interfaces).');
 			info(sprintf(
-				'TypeScript definitions written to %s (%d bytes, %d interfaces).',
+				$template,
 				$ts['path'],
 				$ts['bytes'],
 				count($ts['interfaces'])

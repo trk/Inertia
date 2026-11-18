@@ -31,6 +31,7 @@ final class TypeGenerator extends Wire
 	 * @param bool $generateTs Whether to generate the TypeScript `.d.ts` definitions file
 	 * @param bool $generateControllers Whether to scaffold missing `site/templates/{template}.php` controllers
 	 * @param string|null $tsOutputPath Optional custom output path for the `.d.ts` file
+	 * @param bool $dryRun Preview planned file actions without writing to disk
 	 * @return array{
 	 *     templates: list<string>,
 	 *     phpClasses: list<array{template: string, class: string, path: string, status: string}>,
@@ -44,9 +45,11 @@ final class TypeGenerator extends Wire
 		bool $generatePhp = true,
 		bool $generateTs = true,
 		bool $generateControllers = false,
-		?string $tsOutputPath = null
+		?string $tsOutputPath = null,
+		bool $dryRun = false,
+		bool $allowUncreatedTemplates = false
 	): array {
-		$templates = $this->resolveTargetTemplates($templateNames);
+		$templates = $this->resolveTargetTemplates($templateNames, $allowUncreatedTemplates);
 		$resolvedNames = array_values(array_map(static fn(Template $t): string => (string) $t->name, $templates));
 
 		if ($this->inertia->request->isDemoMode()) {
@@ -63,19 +66,19 @@ final class TypeGenerator extends Wire
 
 		if ($generatePhp) {
 			foreach ($templates as $template) {
-				$phpClasses[] = $this->generatePageClass($template, $force);
+				$phpClasses[] = $this->generatePageClass($template, $force, $dryRun);
 			}
 		}
 
 		if ($generateControllers) {
 			foreach ($templates as $template) {
-				$templateControllers[] = $this->generateTemplateController($template, $force);
+				$templateControllers[] = $this->generateTemplateController($template, $force, $dryRun);
 			}
 		}
 
 		$tsResult = null;
 		if ($generateTs) {
-			$tsResult = $this->writeTypeScriptDefinitions($templates, $tsOutputPath);
+			$tsResult = $this->writeTypeScriptDefinitions($templates, $tsOutputPath, $dryRun);
 		}
 
 		return [
@@ -87,28 +90,94 @@ final class TypeGenerator extends Wire
 	}
 
 	/**
+	 * Validate a candidate frontend ProcessWire template name, rejecting empty, numeric, `'admin'`,
+	 * invalid-character, and `Template::flagSystem` identifiers.
+	 *
+	 * @return array{ok: true, name: string, template: ?Template}|array{ok: false, error: string}
+	 */
+	public function validateTargetTemplateName(string $rawName, bool $requireExisting = false): array
+	{
+		$name = trim($rawName);
+		if (
+			$name === ''
+			|| preg_match('/^[a-zA-Z0-9_-]+$/', $name) !== 1
+			|| ctype_digit($name)
+			|| $name === 'admin'
+		) {
+			return [
+				'ok' => false,
+				'error' => "Invalid or protected template name '{$rawName}'.",
+			];
+		}
+
+		$tpl = $this->wire()->templates->get($name);
+		if ($tpl instanceof Template) {
+			if ((string) $tpl->name !== $name) {
+				return [
+					'ok' => false,
+					'error' => "Invalid or protected template name '{$name}'.",
+				];
+			}
+			if (((int) ($tpl->flags & Template::flagSystem)) !== 0) {
+				return [
+					'ok' => false,
+					'error' => "System template '{$name}' cannot be targeted.",
+				];
+			}
+
+			return [
+				'ok' => true,
+				'name' => $name,
+				'template' => $tpl,
+			];
+		}
+
+		if ($requireExisting) {
+			return [
+				'ok' => false,
+				'error' => "Template '{$name}' does not exist.",
+			];
+		}
+
+		return [
+			'ok' => true,
+			'name' => $name,
+			'template' => null,
+		];
+	}
+
+	/**
 	 * Resolve the list of ProcessWire `Template` objects to inspect.
 	 *
 	 * @param list<string>|null $templateNames
 	 * @return list<Template>
 	 */
-	private function resolveTargetTemplates(?array $templateNames = null): array
+	private function resolveTargetTemplates(?array $templateNames = null, bool $allowUncreatedTemplates = false): array
 	{
 		$templatesApi = $this->wire()->templates;
 
 		$result = [];
 		$seen = [];
 
-		if ($templateNames !== null && $templateNames !== []) {
+		if ($templateNames !== null) {
 			foreach ($templateNames as $rawName) {
-				$name = trim($rawName);
-				if ($name === '' || $name === 'admin' || isset($seen[$name])) {
+				$validated = $this->validateTargetTemplateName($rawName, !$allowUncreatedTemplates);
+				if (!$validated['ok'] || isset($seen[$validated['name']])) {
 					continue;
 				}
-				$tpl = $templatesApi->get($name);
-				if ($tpl instanceof Template && !($tpl->flags & Template::flagSystem)) {
+				$name = $validated['name'];
+				$tpl = $validated['template'];
+				if ($tpl instanceof Template) {
 					$seen[$name] = true;
 					$result[] = $tpl;
+					continue;
+				}
+				if ($allowUncreatedTemplates) {
+					$placeholder = new Template();
+					$this->wire($placeholder);
+					$placeholder->name = $name;
+					$seen[$name] = true;
+					$result[] = $placeholder;
 				}
 			}
 
@@ -116,7 +185,7 @@ final class TypeGenerator extends Wire
 		}
 
 		foreach ($templatesApi as $tpl) {
-			if (!$tpl instanceof Template || ($tpl->flags & Template::flagSystem)) {
+			if (!$tpl instanceof Template || ((int) ($tpl->flags & Template::flagSystem)) !== 0) {
 				continue;
 			}
 			$name = (string) $tpl->name;
@@ -135,21 +204,25 @@ final class TypeGenerator extends Wire
 	 *
 	 * @return array{template: string, class: string, path: string, status: string}
 	 */
-	public function generatePageClass(Template $template, bool $force = false): array
+	public function generatePageClass(Template $template, bool $force = false, bool $dryRun = false): array
 	{
 		$tplName = (string) $template->name;
 		$pascal = ProviderRegistry::studly($tplName);
 		$className = $pascal . 'Page';
 
-		$sitePath = rtrim((string) $this->wire()->config->paths->site, '/\\');
-		$classesDir = $sitePath !== '' ? $sitePath . '/classes' : dirname(__DIR__, 4) . '/classes';
+		$config = $this->wire()->config;
+		$configuredClasses = rtrim((string) $config->paths->classes, '/\\');
+		$sitePath = rtrim((string) $config->paths->site, '/\\');
+		$classesDir = $configuredClasses !== ''
+			? $configuredClasses
+			: ($sitePath !== '' ? $sitePath . '/classes' : dirname(__DIR__, 4) . '/classes');
 		$filePath = $classesDir . '/' . $className . '.php';
 
 		return [
 			'template' => $tplName,
 			'class' => $className,
 			'path' => $filePath,
-			'status' => $this->writeScaffoldFile($filePath, fn(): string => $this->buildPageClassCode($template), $force),
+			'status' => $this->writeScaffoldFile($filePath, fn(): string => $this->buildPageClassCode($template), $force, $dryRun),
 		];
 	}
 
@@ -159,7 +232,7 @@ final class TypeGenerator extends Wire
 	 *
 	 * @return array{template: string, path: string, status: string}
 	 */
-	private function generateTemplateController(Template $template, bool $force = false): array
+	private function generateTemplateController(Template $template, bool $force = false, bool $dryRun = false): array
 	{
 		$tplName = (string) preg_replace('/[^a-zA-Z0-9_-]/', '', (string) $template->name);
 		if ($tplName === '') {
@@ -171,7 +244,7 @@ final class TypeGenerator extends Wire
 		return [
 			'template' => $tplName,
 			'path' => $filePath,
-			'status' => $this->writeScaffoldFile($filePath, fn(): string => $this->buildTemplateControllerCode($template), $force),
+			'status' => $this->writeScaffoldFile($filePath, fn(): string => $this->buildTemplateControllerCode($template), $force, $dryRun),
 		];
 	}
 
@@ -264,11 +337,11 @@ PHP;
 	 * @param list<Template> $templates
 	 * @return array{path: string, written: bool, bytes: int, interfaces: list<string>}
 	 */
-	private function writeTypeScriptDefinitions(array $templates, ?string $customOutputPath = null): array
+	private function writeTypeScriptDefinitions(array $templates, ?string $customOutputPath = null, bool $dryRun = false): array
 	{
 		$targetPath = $this->resolveTypeScriptOutputPath($customOutputPath);
 		$built = $this->buildTypeScriptDefinitions($templates);
-		$written = $this->writeFileSafely($targetPath, $built['content']);
+		$written = $dryRun ? false : $this->writeFileSafely($targetPath, $built['content']);
 
 		return [
 			'path' => $targetPath,
@@ -419,12 +492,19 @@ TS;
 	}
 
 	/**
+	 * Validate an explicit custom TypeScript `.d.ts` output path before CLI execution.
+	 */
+	public function isValidCustomOutputPath(string $customOutputPath): bool
+	{
+		return $this->resolveValidatedOutputPath(trim($customOutputPath), true) !== null;
+	}
+
+	/**
 	 * Resolve the absolute filesystem path for the TypeScript `.d.ts` output file.
 	 */
 	private function resolveTypeScriptOutputPath(?string $customOutputPath = null): string
 	{
-		$config = $this->wire()->config;
-		$templatesPath = rtrim((string) $config->paths->templates, '/\\');
+		$templatesPath = rtrim((string) $this->wire()->config->paths->templates, '/\\');
 		$defaultOutput = $templatesPath . '/assets/js/types/inertia.d.ts';
 
 		$hasExplicitCustomPath = $customOutputPath !== null && trim($customOutputPath) !== '';
@@ -432,26 +512,34 @@ TS;
 			? trim($customOutputPath)
 			: trim((string) $this->inertia->typeScriptOutputPath);
 
+		return $this->resolveValidatedOutputPath($rawPath, $hasExplicitCustomPath) ?? $defaultOutput;
+	}
+
+	private function resolveValidatedOutputPath(string $rawPath, bool $allowSystemTempDir): ?string
+	{
 		if ($rawPath === '' || str_contains($rawPath, "\0")) {
-			return $defaultOutput;
+			return null;
 		}
 
 		$normalized = str_replace('\\', '/', $rawPath);
 		foreach (explode('/', $normalized) as $segment) {
 			if ($segment === '..') {
-				return $defaultOutput;
+				return null;
 			}
 		}
 
-		if (!str_ends_with(strtolower($normalized), '.ts')) {
-			return $defaultOutput;
+		$lowerNormalized = strtolower($normalized);
+		if (!str_ends_with($lowerNormalized, '.ts') || basename($lowerNormalized) === '.ts') {
+			return null;
 		}
 
+		$config = $this->wire()->config;
+		$templatesPath = rtrim((string) $config->paths->templates, '/\\');
 		$sitePath = rtrim(str_replace('\\', '/', (string) $config->paths->site), '/');
 		$realSite = $sitePath !== '' ? realpath($sitePath) : false;
 		$realSitePrefix = is_string($realSite) ? rtrim(str_replace('\\', '/', $realSite), '/') . '/' : '';
-		$tempDir = $hasExplicitCustomPath ? rtrim(str_replace('\\', '/', sys_get_temp_dir()), '/') : '';
-		$realTempDir = $hasExplicitCustomPath ? realpath(sys_get_temp_dir()) : false;
+		$tempDir = $allowSystemTempDir ? rtrim(str_replace('\\', '/', sys_get_temp_dir()), '/') : '';
+		$realTempDir = $allowSystemTempDir ? realpath(sys_get_temp_dir()) : false;
 		$realTempPrefix = is_string($realTempDir) ? rtrim(str_replace('\\', '/', $realTempDir), '/') . '/' : '';
 
 		if (str_starts_with($rawPath, '/') || preg_match('/^[A-Za-z]:[\\\\\/]/', $rawPath) === 1) {
@@ -461,7 +549,7 @@ TS;
 				|| ($realTempPrefix !== '' && str_starts_with($normalized, $realTempPrefix));
 
 			if (!$inSite && !$inTemp) {
-				return $defaultOutput;
+				return null;
 			}
 
 			$candidate = $rawPath;
@@ -470,7 +558,12 @@ TS;
 		}
 
 		if (is_link($candidate)) {
-			return $defaultOutput;
+			return null;
+		}
+
+		$candidateDir = dirname($candidate);
+		if (is_link($candidateDir) || $this->hasSymlinkedAncestor($candidateDir)) {
+			return null;
 		}
 
 		$probe = $candidate;
@@ -488,7 +581,7 @@ TS;
 			$allowedReal = ($realSitePrefix !== '' && str_starts_with($realProbeSlash, $realSitePrefix))
 				|| ($realTempPrefix !== '' && str_starts_with($realProbeSlash, $realTempPrefix));
 			if (!$allowedReal) {
-				return $defaultOutput;
+				return null;
 			}
 		}
 
@@ -499,9 +592,9 @@ TS;
 	 * Write a scaffolded file to disk unless it already exists and `$force` is `false`.
 	 *
 	 * @param string|callable(): string $content
-	 * @return 'skipped'|'updated'|'created'
+	 * @return 'skipped'|'updated'|'created'|'would_update'|'would_create'
 	 */
-	public function writeScaffoldFile(string $filePath, string|callable $content, bool $force = false): string
+	public function writeScaffoldFile(string $filePath, string|callable $content, bool $force = false, bool $dryRun = false): string
 	{
 		if ($this->inertia->request->isDemoMode() || is_link($filePath)) {
 			return 'skipped';
@@ -510,6 +603,10 @@ TS;
 		$existed = is_file($filePath);
 		if ($existed && !$force) {
 			return 'skipped';
+		}
+
+		if ($dryRun) {
+			return $existed ? 'would_update' : 'would_create';
 		}
 
 		$resolvedContent = is_string($content) ? $content : (string) $content();
@@ -529,7 +626,7 @@ TS;
 		}
 
 		$dir = dirname($filePath);
-		if (is_link($dir)) {
+		if (is_link($dir) || $this->hasSymlinkedAncestor($dir)) {
 			return false;
 		}
 
@@ -539,10 +636,45 @@ TS;
 			$files->mkdir($dir, true);
 		}
 
-		if (is_link($dir) || is_link($filePath)) {
-			return false;
-		}
+		clearstatcache(true, $dir);
+		clearstatcache(true, $filePath);
 
 		return (bool) $files->filePutContents($filePath, $content, LOCK_EX);
+	}
+
+	/**
+	 * Ensure no ancestor directory between `$dir` and `$config->paths->site` (or `sys_get_temp_dir()`) is a symbolic link.
+	 */
+	private function hasSymlinkedAncestor(string $dir): bool
+	{
+		$config = $this->wire()->config;
+		$siteRootRaw = rtrim((string) $config->paths->site, '/\\');
+		$siteRoot = str_replace('\\', '/', $siteRootRaw);
+		$realSiteRaw = $siteRootRaw !== '' && is_dir($siteRootRaw) ? realpath($siteRootRaw) : false;
+		$realSiteRoot = is_string($realSiteRaw) ? rtrim(str_replace('\\', '/', $realSiteRaw), '/') : '';
+
+		$tempRootRaw = rtrim(sys_get_temp_dir(), '/\\');
+		$tempRoot = str_replace('\\', '/', $tempRootRaw);
+		$realTempRaw = $tempRootRaw !== '' && is_dir($tempRootRaw) ? realpath($tempRootRaw) : false;
+		$realTempRoot = is_string($realTempRaw) ? rtrim(str_replace('\\', '/', $realTempRaw), '/') : '';
+
+		$stopRoots = array_values(array_filter(
+			[$siteRoot, $realSiteRoot, $tempRoot, $realTempRoot],
+			static fn(string $root): bool => $root !== ''
+		));
+
+		$cursor = rtrim(str_replace('\\', '/', $dir), '/');
+		while ($cursor !== '' && !in_array($cursor, $stopRoots, true)) {
+			if (is_link($cursor)) {
+				return true;
+			}
+			$parent = str_replace('\\', '/', dirname($cursor));
+			if ($parent === $cursor) {
+				break;
+			}
+			$cursor = rtrim($parent, '/');
+		}
+
+		return false;
 	}
 }
