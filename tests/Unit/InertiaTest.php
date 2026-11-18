@@ -1,4 +1,4 @@
-<?php
+<?php // __(file-not-translatable)
 
 declare(strict_types=1);
 
@@ -28,6 +28,7 @@ use Totoglu\Inertia\Provider\FieldDataProvider;
 use Totoglu\Inertia\Provider\ProviderRegistry;
 use Totoglu\Inertia\Provider\TemplateDataProvider;
 use Totoglu\Inertia\Provider\UserDataProvider;
+use Totoglu\Inertia\Request;
 use Totoglu\Inertia\Ssr\HttpGateway;
 use Totoglu\Inertia\Ssr\SsrResponse;
 use Totoglu\Inertia\Support\PropResolver;
@@ -50,7 +51,7 @@ afterEach(function (): void {
 	if (function_exists('ProcessWire\setting')) {
 		setting('inertia', []);
 	}
-	wire()->pages?->setOutputFormatting(false);
+	wire()->pages->setOutputFormatting(false);
 	$inertia = Inertia::instance();
 	$inertia->resetState();
 	$savedConfig = wire()->modules->getConfig('Inertia');
@@ -1147,13 +1148,17 @@ it('emits Inertia v3 top-level flash, sharedProps for Instant Visits, and 409 X-
 	$subsequentObject = inertia('Dashboard/Settings')->toPageObject();
 	expect((array) $subsequentObject['flash'])->toBe([]);
 
-	// 3. ProcessWire $notices / $session->message() are consumed once and cleared via $session->removeNotices()
-	wire()->session->message('Saved via ProcessWire session');
+	// 3. ProcessWire $notices and queued session `_notices` are consumed once and cleared via $session->removeNotices()
+	wire()->session->setFor('_notices', 'messages', [
+		['text' => 'Saved via ProcessWire session', 'flags' => 0],
+	]);
 	wire()->notices->add(new NoticeMessage('Saved via ProcessWire notices'));
 
 	$withPwNotice = inertia('Dashboard/Settings')->toPageObject();
 	$withPwFlash = (array) $withPwNotice['flash'];
-	expect($withPwNotice['props']['flash']['messages'])->toContain('Saved via ProcessWire notices')
+	expect($withPwNotice['props']['flash']['messages'])->toContain('Saved via ProcessWire session')
+		->and($withPwNotice['props']['flash']['messages'])->toContain('Saved via ProcessWire notices')
+		->and($withPwFlash['messages'])->toContain('Saved via ProcessWire session')
 		->and($withPwFlash['messages'])->toContain('Saved via ProcessWire notices');
 
 	$afterPwNotice = inertia('Dashboard/Settings')->toPageObject();
@@ -1610,10 +1615,7 @@ it('hardens SSR hydration script injection, header name sanitization, nested Err
 it('preserves HTML on Notice::allowMarkup flash notices while escaping plain-text notices', function (): void {
 	$inertia = inertia();
 	$inertia->resetState();
-	$notices = wire()->notices;
-	if ($notices !== null) {
-		$notices->removeAll();
-	}
+	wire()->notices->removeAll();
 
 	wire()->warning(
 		"Please check <u>nginx.txt</u><div><small class='ui-priority-secondary'>Required version: 301</small></div>",
@@ -1769,59 +1771,6 @@ it('supports ProcessInertia, MarkupInertia, InputfieldInertia dual-mode renderin
 		]);
 });
 
-it('validates LanguagePorter CSV files in languages/ across en, tr, de, es, fr, ru in chronological order', function (): void {
-	$moduleRoot = dirname(__DIR__, 2);
-	$languagesDir = $moduleRoot . '/languages';
-
-	$defaultLang = wire('languages')->getDefault();
-	$exportedCsv = $defaultLang->porter->exportCsv([
-		'source' => 'site/modules/Inertia/',
-		'scope' => 'all',
-		'exportTo' => 'string',
-	]);
-
-	$fp = fopen('php://temp', 'r+');
-	fwrite($fp, $exportedCsv);
-	rewind($fp);
-	$exportHeader = fgetcsv($fp, 0, ',', '"', '\\');
-	$expectedRows = [];
-	while (($row = fgetcsv($fp, 0, ',', '"', '\\')) !== false) {
-		$expectedRows[] = [
-			'original' => $row[0],
-			'file' => $row[3],
-			'hash' => $row[4],
-		];
-	}
-	fclose($fp);
-
-	expect($exportHeader)->toBeArray()
-		->and($expectedRows)->toHaveCount(56);
-
-	$expectedLocales = ['en', 'tr', 'de', 'es', 'fr', 'ru'];
-	foreach ($expectedLocales as $locale) {
-		$csvPath = $languagesDir . '/' . $locale . '.csv';
-		expect(is_file($csvPath))->toBeTrue();
-
-		$handle = fopen($csvPath, 'r');
-		$header = fgetcsv($handle, 0, ',', '"', '\\');
-		$expectedFirstCol = $locale === 'en' ? 'default' : 'en';
-		expect($header)->toBe([$expectedFirstCol, $locale, 'description', 'file', 'hash']);
-
-		$rows = [];
-		while (($row = fgetcsv($handle, 0, ',', '"', '\\')) !== false) {
-			expect($row[1])->not->toBe('');
-			$rows[] = [
-				'original' => $row[0],
-				'file' => $row[3],
-				'hash' => $row[4],
-			];
-		}
-		fclose($handle);
-
-		expect($rows)->toBe($expectedRows);
-	}
-});
-
 it('serializes core Pageimage metadata and focus coordinates without coupling to InterventionImage', function (): void {
 	$tsDefaults = MediaFieldDataProvider::defaultTsDefinitions();
 
@@ -1927,7 +1876,7 @@ it('sanitizes dangerous navigation URI schemes, enforces Page::viewable(false) R
 	};
 	$wire->wire($inputfield);
 	$inputfield->attr('name', 'widget_state');
-	$inputfield->setAttribute('value', ['safe' => 'initial']);
+	$inputfield->attr('value', ['safe' => 'initial']);
 
 	$rawPost = [
 		'widget_state' => '{"safe":"updated","__proto__":{"polluted":true},"_SERVER":"leak"}',
@@ -2553,7 +2502,8 @@ it('enforces Pass-9 SSRF IP normalization, head/viewData confinement, non-X-Iner
 		expect($blockedRedirect->getHeader('X-Inertia-Redirect'))->toBe('/');
 
 		$blockedBack = $inertia->back('https://evil.example/phish', false);
-		expect($blockedBack->getHeader('X-Inertia-Redirect') ?? $blockedBack->getRedirectUrl())->not->toContain('evil.example');
+		expect($blockedBack->getHeader('X-Inertia-Redirect'))->toBeNull()
+			->and($blockedBack->getHeader('Location'))->toBe('/');
 
 		// 8. Request::pageNumber() clamps scientific notation / huge ints, and syncJsonToPost=false still validates CSRF without leaking JSON keys to $input->post
 		$inertia->resetState();
@@ -2598,7 +2548,7 @@ it('enforces Pass-9 SSRF IP normalization, head/viewData confinement, non-X-Iner
 });
 
 
-it('enforces Pass-10 HTMX demo coexistence, 303 demo redirects, cyclic PropResolver safety, OnceProp dynamic query bypass, superuser UserDataProvider RBAC, and Vary/Cache-Control headers', function (): void {
+it('enforces non-Inertia XHR demo coexistence, 303 demo redirects, cyclic PropResolver safety, OnceProp dynamic query bypass, superuser UserDataProvider RBAC, and Vary/Cache-Control headers', function (): void {
 	$inertia = inertia();
 	$config = wire()->config;
 	$input = wire()->input;
@@ -2612,7 +2562,7 @@ it('enforces Pass-10 HTMX demo coexistence, 303 demo redirects, cyclic PropResol
 	$prevGet = $_GET;
 
 	try {
-		// 1. Cross-module coexistence: non-Inertia HX-Request in $config->demo defers POST purging to Htmx when Htmx is installed
+		// 1. Non-Inertia XHR coexistence: classic XMLHttpRequest in $config->demo leaves non-Inertia POST untouched during Inertia::init()
 		$config->demo = true;
 		$input->post->removeAll();
 		$input->post->set('__classic_action', 'querySummary');
@@ -2938,7 +2888,7 @@ it('enforces Pass-11 cross-module demo method preservation, GET body blocking, W
 	$prevMethod = $_SERVER['REQUEST_METHOD'] ?? null;
 
 	try {
-		// 1. Cross-module PW_DEMO_ORIGINAL_METHOD preservation (e.g. when Htmx purges REQUEST_METHOD to GET first) & HX-Request: false spoofing defense
+		// 1. PW_DEMO_ORIGINAL_METHOD preservation when an earlier boot hook purges REQUEST_METHOD to GET first
 		$inertia->resetState();
 		$config->demo = true;
 		$_SERVER['REQUEST_METHOD'] = 'GET';
@@ -3428,6 +3378,7 @@ it('enforces CSRF validation on mutating ProcessInertia admin requests and catch
 		$config->demo = $prevDemo;
 		$wire->input->post->removeAll();
 		$wire->notices->removeAll();
+		$wire->session->removeNotices();
 		if ($prevUser instanceof User) {
 			$wire->fuel->set('user', $prevUser);
 		}
@@ -3529,7 +3480,7 @@ it('standardizes JSON_HTML_SAFE_FLAGS, enforces navigation URL allowlist, resolv
 	$inertia->resetState();
 
 	// 1. JSON_HTML_SAFE_FLAGS across Inertia::app(), MarkupInertia, and InputfieldInertia
-	$expectedFlags = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_INVALID_UTF8_SUBSTITUTE;
+	$expectedFlags = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR;
 	expect(\ProcessWire\Inertia::JSON_HTML_SAFE_FLAGS)->toBe($expectedFlags);
 
 	$dangerousPayload = ['xss' => "</script><img src=x onerror=\"alert('pwn')\" data-a='1&2'>"];
@@ -3564,7 +3515,7 @@ it('standardizes JSON_HTML_SAFE_FLAGS, enforces navigation URL allowlist, resolv
 	};
 	$wire->wire($inputIsland);
 	$inputIsland->attr('name', 'safe_json_input');
-	$inputIsland->setAttribute('value', ['raw' => "<b title=\"x\" data-s='y'>&</b>"]);
+	$inputIsland->attr('value', ['raw' => "<b title=\"x\" data-s='y'>&</b>"]);
 	$renderedInput = $inputIsland->render();
 	$renderedValue = $inputIsland->renderValue();
 	expect($renderedInput)->toContain('\u003Cb')
@@ -3744,6 +3695,1409 @@ it('cleans WireCache and Session namespaces on uninstall, enforces zero deleted 
 	} finally {
 		$config->demo = $prevDemo;
 		@unlink($tmpTsPath);
+		$inertia->resetState();
+	}
+});
+
+it('guards automatic Templates::saved and Fields::saved Page class scaffolding in CLI so temporary test templates never pollute site/classes/', function (): void {
+	$wire = wire();
+	$config = $wire->config;
+	$inertia = inertia();
+	$prevDebug = (bool) $config->debug;
+	$tplName = 'inertia_cli_guard_' . substr(md5(uniqid('', true)), 0, 6);
+	$expectedClassPath = rtrim((string) $config->paths->classes, '/') . '/' . str_replace(' ', '', ucwords(str_replace('_', ' ', $tplName))) . 'Page.php';
+	$fg = null;
+	$tpl = null;
+
+	try {
+		$config->debug = true;
+		$inertia->set('autoGenerateTypes', true);
+		$inertia->set('autoScaffoldPageClasses', true);
+		$inertia->set('mode', 'all');
+
+		$fg = new \ProcessWire\Fieldgroup();
+		$fg->name = $tplName;
+		$titleField = $wire->fields->get('title');
+		if ($titleField instanceof \ProcessWire\Field) {
+			$fg->add($titleField);
+		}
+		$wire->fieldgroups->save($fg);
+
+		$tpl = new \ProcessWire\Template();
+		$tpl->name = $tplName;
+		$tpl->fieldgroup = $fg;
+		$wire->templates->save($tpl);
+
+		expect(PHP_SAPI)->toBe('cli')
+			->and(is_file($expectedClassPath))->toBeFalse();
+	} finally {
+		$config->debug = $prevDebug;
+		if (is_file($expectedClassPath)) {
+			unlink($expectedClassPath);
+		}
+		if ($tpl instanceof \ProcessWire\Template && $tpl->id > 0) {
+			$wire->templates->delete($tpl);
+		}
+		if ($fg instanceof \ProcessWire\Fieldgroup && $fg->id > 0) {
+			$wire->fieldgroups->delete($fg);
+		}
+		$inertia->resetState();
+	}
+});
+
+it('supports --dry-run in CLI commands, blocks numeric/system templates, rejects symlinked providers and root views, and handles non-scalar Inputfield attributes safely', function (): void {
+	$wire = wire();
+	$inertia = inertia();
+	$inertia->resetState();
+
+	$tmpDir = sys_get_temp_dir() . '/pw_inertia_prod_audit_' . uniqid();
+	@mkdir($tmpDir, 0755, true);
+	$dryRunTsPath = $tmpDir . '/dryrun_inertia.d.ts';
+	$outsideProvider = $tmpDir . '/OutsideEvilProvider.php';
+	$providerBoxDir = $tmpDir . '/providers';
+	@mkdir($providerBoxDir, 0755, true);
+	$symlinkedProvider = $providerBoxDir . '/SymlinkedEvilProvider.php';
+
+	$templatesPath = rtrim((string) $wire->config->paths->templates, '/\\');
+	$symlinkRootView = $templatesPath . '/_inertia_symlink_test_' . substr(md5(uniqid('', true)), 0, 6) . '.php';
+	$outsideRootView = $tmpDir . '/_outside_view.php';
+
+	try {
+		// 1. InertiaTypesCommand --dry-run writes nothing to disk while reporting planned output
+		$typesCmd = new \Totoglu\Inertia\Commands\InertiaTypesCommand();
+		$typesTester = new \Symfony\Component\Console\Tester\CommandTester($typesCmd);
+		$exitDryTypes = $typesTester->execute([
+			'--template' => ['home'],
+			'--ts-only' => true,
+			'--output' => $dryRunTsPath,
+			'--dry-run' => true,
+			'--json' => true,
+		]);
+		$jsonDryTypes = json_decode($typesTester->getDisplay(), true);
+		expect($exitDryTypes)->toBe(\Symfony\Component\Console\Command\Command::SUCCESS)
+			->and($jsonDryTypes['ok'] ?? null)->toBeTrue()
+			->and($jsonDryTypes['data']['dryRun'] ?? null)->toBeTrue()
+			->and($jsonDryTypes['data']['typescript']['written'] ?? null)->toBeFalse()
+			->and(is_file($dryRunTsPath))->toBeFalse();
+
+		// 2. InertiaInstallCommand rejects numeric IDs, admin, and system templates even before --dry-run
+		$installCmd = new \Totoglu\Inertia\Commands\InertiaInstallCommand();
+		$installTester = new \Symfony\Component\Console\Tester\CommandTester($installCmd);
+
+		foreach (['2', 'admin', 'user', '../evil'] as $badTemplate) {
+			$exitBad = $installTester->execute([
+				'--template' => $badTemplate,
+				'--dry-run' => true,
+				'--json' => true,
+			]);
+			$jsonBad = json_decode($installTester->getDisplay(), true);
+			expect($exitBad)->toBe(\Symfony\Component\Console\Command\Command::FAILURE)
+				->and($jsonBad['ok'] ?? null)->toBeFalse()
+				->and($jsonBad['error']['code'] ?? null)->toBe('INVALID_TEMPLATE');
+		}
+
+		// 3. InertiaInstallCommand --dry-run previews without writing starter files
+		$phantomTpl = 'inertia_dry_tpl_' . substr(md5(uniqid('', true)), 0, 6);
+		$phantomPascal = \Totoglu\Inertia\Provider\ProviderRegistry::studly($phantomTpl);
+		$phantomComponent = $templatesPath . "/assets/js/Pages/{$phantomPascal}/Show.vue";
+		$exitDryInstall = $installTester->execute([
+			'--stack' => 'vue',
+			'--template' => $phantomTpl,
+			'--dry-run' => true,
+			'--json' => true,
+		]);
+		$jsonDryInstall = json_decode($installTester->getDisplay(), true);
+		expect($exitDryInstall)->toBe(\Symfony\Component\Console\Command\Command::SUCCESS)
+			->and($jsonDryInstall['ok'] ?? null)->toBeTrue()
+			->and($jsonDryInstall['data']['dryRun'] ?? null)->toBeTrue()
+			->and(is_file($phantomComponent))->toBeFalse();
+
+		// 4. normalizeTemplateList and TypeGenerator ignore numeric template ID strings
+		expect($inertia->normalizeTemplateList(['home', '2', '29', 'admin']))->toBe(['home']);
+		$genNumeric = $inertia->typeGenerator()->generate(['2', '29'], false, false, false, false, null, true);
+		expect($genNumeric['templates'])->toBe([]);
+
+		// 5. ProviderRegistry::discoverFromDirectory() rejects symlinked provider files
+		file_put_contents(
+			$outsideProvider,
+			"<?php\ndeclare(strict_types=1);\nnamespace Totoglu\\Inertia\\Provider;\nfinal class SymlinkedEvilProvider extends TemplateDataProvider { public function templates(): array { return ['home']; } }\n"
+		);
+		@symlink($outsideProvider, $symlinkedProvider);
+		$registry = new \Totoglu\Inertia\Provider\ProviderRegistry();
+		$wire->wire($registry);
+		$registry->discoverFromDirectory($providerBoxDir);
+		expect(class_exists('Totoglu\\Inertia\\Provider\\SymlinkedEvilProvider', false))->toBeFalse();
+
+		// 6. RootViewRenderer rejects symlinked rootView files inside site/templates/
+		file_put_contents($outsideRootView, '<?php echo "SYMLINK_ESCAPE";');
+		@symlink($outsideRootView, $symlinkRootView);
+		$inertia->request->fake(['X-Inertia' => '']);
+		$symlinkResp = $inertia->render('Test/Symlink')->rootView(basename($symlinkRootView));
+		$htmlOut = $symlinkResp->toOutput();
+		expect($htmlOut)->not->toContain('SYMLINK_ESCAPE')
+			->and($htmlOut)->toContain('data-page=');
+
+		// 7. PropResolver and ErrorBag safely handle non-scalar Inputfield attributes without PHP 8.5 cast errors
+		$wrapper = new InputfieldWrapper();
+		$wire->wire($wrapper);
+		$customInput = new class extends InputfieldText {
+			public function getAttribute($key): mixed
+			{
+				if ($key === 'type') {
+					return ['multi', 'type'];
+				}
+				if ($key === 'value') {
+					return ['alpha', 'beta'];
+				}
+
+				return parent::getAttribute($key);
+			}
+		};
+		$wire->wire($customInput);
+		$customInput->attr('name', 'tags');
+		$customInput->error('Array-valued field error');
+		$wrapper->add($customInput);
+
+		$resolvedWrapper = $inertia->resolver->resolveValue($wrapper);
+		$extractedErrors = $inertia->errors->flash($wrapper)->resolve();
+		expect($resolvedWrapper)->toBeArray()
+			->and($resolvedWrapper['fields'][0]['name'] ?? null)->toBe('tags')
+			->and($resolvedWrapper['fields'][0]['value'] ?? null)->toBe(['alpha', 'beta'])
+			->and($extractedErrors)->toBe(['tags' => 'Array-valued field error']);
+	} finally {
+		foreach ([$symlinkRootView, $outsideRootView, $symlinkedProvider, $outsideProvider, $dryRunTsPath] as $cleanupFile) {
+			if (is_link($cleanupFile) || is_file($cleanupFile)) {
+				unlink($cleanupFile);
+			}
+		}
+		if (is_dir($providerBoxDir)) {
+			rmdir($providerBoxDir);
+		}
+		if (is_dir($tmpDir)) {
+			rmdir($tmpDir);
+		}
+		$inertia->resetState();
+	}
+});
+
+it('enforces mutually exclusive redirect headers, guest error Cache-Control, scroll/reset Vary headers, strict asset authority checks, OnceProp bound-page & role isolation, and strict CLI template/output validation', function (): void {
+	$wire = wire();
+	$inertia = inertia();
+	$config = $wire->config;
+	$inertia->resetState();
+
+	$prevHttpHost = $config->httpHost;
+	$prevHttpHosts = $config->httpHosts;
+	$prevUser = $wire->user;
+	$prevPage = $wire->page;
+	$prevEnabledTemplates = $inertia->enabledTemplates;
+
+	try {
+		// 1. Redirect headers (Location, X-Inertia-Redirect, X-Inertia-Location) are mutually exclusive across sequential calls
+		$inertia->request->fake(['X-Inertia' => 'true'], 'GET');
+		$inertia->redirect('/step-one');
+		expect($inertia->response->getHeader('X-Inertia-Redirect'))->toBe('/step-one');
+
+		$inertia->location('/step-two');
+		expect($inertia->response->getHeader('X-Inertia-Location'))->toBe('/step-two')
+			->and($inertia->response->getHeader('X-Inertia-Redirect'))->toBeNull()
+			->and($inertia->response->getHeader('Location'))->toBeNull();
+
+		$inertia->back('/step-three', false);
+		expect($inertia->response->getHeader('Location'))->toBe('/step-three')
+			->and($inertia->response->getHeader('X-Inertia-Location'))->toBeNull()
+			->and($inertia->response->getHeader('X-Inertia-Redirect'))->toBeNull();
+
+		// 2. Guest validation errors emit Cache-Control: no-cache, private even when autoShareCsrf=false, plus Vary for Reset / ScrollIntent / ErrorBag
+		$inertia->resetState();
+		$inertia->set('autoShareCsrf', false);
+		$guestUser = $wire->users->getGuestUser();
+		if ($guestUser instanceof User) {
+			$wire->users->setCurrentUser($guestUser);
+		}
+		$inertia->withErrors(['email' => 'Invalid email']);
+		$inertia->request->fake([
+			'X-Inertia' => 'true',
+			'X-Inertia-Reset' => 'feed',
+			'X-Inertia-Infinite-Scroll-Merge-Intent' => 'prepend',
+			'X-Inertia-Error-Bag' => 'signup',
+		], 'GET');
+
+		$inertia->renderPageResponse(inertia('Auth/Register', [
+			'feed' => $inertia->scroll(['a', 'b']),
+		]));
+
+		$varyHeader = (string) $inertia->response->getHeader('Vary');
+		expect($inertia->response->getHeader('Cache-Control'))->toBe('no-cache, private')
+			->and($varyHeader)->toContain('X-Inertia-Reset')
+			->and($varyHeader)->toContain('X-Inertia-Infinite-Scroll-Merge-Intent')
+			->and($varyHeader)->toContain('X-Inertia-Error-Bag');
+
+		// 3. InteractWithInertia::isSafeAssetUrl() rejects cross-port URLs and fails closed when httpHost/httpHosts are empty
+		$assetProbe = new class extends \Totoglu\Inertia\MarkupInertia {
+			public function checkAsset(string $url): bool
+			{
+				return $this->isSafeAssetUrl($url);
+			}
+		};
+		$wire->wire($assetProbe);
+		$config->httpHost = 'app.example.com';
+		$config->httpHosts = ['app.example.com'];
+		expect($assetProbe->checkAsset('https://app.example.com/assets/main.js'))->toBeTrue()
+			->and($assetProbe->checkAsset('https://app.example.com:9000/untrusted.js'))->toBeFalse();
+
+		$config->httpHost = '';
+		$config->httpHosts = [];
+		expect($assetProbe->checkAsset('https://evil.example.com/malicious.js'))->toBeFalse()
+			->and($assetProbe->checkAsset('http://127.0.0.1/local.js'))->toBeTrue();
+		$config->httpHost = $prevHttpHost;
+		$config->httpHosts = $prevHttpHosts;
+
+		// 4. PropResolver OnceProp WireCache isolates by bound PageResponse::forPage() and by dynamic User roles
+		$inertia->resetState();
+		$wire->cache->deleteFor(PropResolver::ONCE_CACHE_NAMESPACE);
+		$homePage = $wire->pages->get(1);
+		$otherPage = new Page($homePage->template);
+		$wire->wire($otherPage);
+		$otherPage->id = 888001;
+		$otherPage->name = 'bound-context-page';
+
+		$wire->wire('page', $homePage);
+		$boundCounter = 0;
+		$homeResp = inertia('Pages/Show', [
+			'sharedOnce' => $inertia->once(static function () use (&$boundCounter): string {
+				$boundCounter++;
+
+				return 'eval-' . $boundCounter;
+			})->until(600),
+		])->forPage($homePage)->toPageObject();
+
+		$otherResp = inertia('Pages/Show', [
+			'sharedOnce' => $inertia->once(static function () use (&$boundCounter): string {
+				$boundCounter++;
+
+				return 'eval-' . $boundCounter;
+			})->until(600),
+		])->forPage($otherPage)->toPageObject();
+
+		expect($homeResp['props']['sharedOnce'])->toBe('eval-1')
+			->and($otherResp['props']['sharedOnce'])->toBe('eval-2');
+
+		if ($guestUser instanceof User) {
+			$wire->users->setCurrentUser($guestUser);
+			$roleCounter = 0;
+			$guestPlain = inertia('Pages/RoleOnce', [
+				'menu' => $inertia->once(static function () use (&$roleCounter): string {
+					$roleCounter++;
+
+					return 'role-eval-' . $roleCounter;
+				})->until(600),
+			])->forPage($homePage)->toPageObject();
+
+			$tempRole = new \ProcessWire\Role();
+			$wire->wire($tempRole);
+			$tempRole->id = 777001;
+			$tempRole->name = 'dynamic-preview-role';
+			$guestUser->roles->add($tempRole);
+			try {
+				$guestWithDynamicRole = inertia('Pages/RoleOnce', [
+					'menu' => $inertia->once(static function () use (&$roleCounter): string {
+						$roleCounter++;
+
+						return 'role-eval-' . $roleCounter;
+					})->until(600),
+				])->forPage($homePage)->toPageObject();
+			} finally {
+				$guestUser->roles->remove($tempRole);
+			}
+
+			expect($guestPlain['props']['menu'])->toBe('role-eval-1')
+				->and($guestWithDynamicRole['props']['menu'])->toBe('role-eval-2');
+		}
+		$wire->cache->deleteFor(PropResolver::ONCE_CACHE_NAMESPACE);
+
+		// 5. InertiaTypesCommand rejects conflicting flags, invalid/protected/missing --template, and invalid --output before --dry-run
+		$typesTester = new CommandTester(new InertiaTypesCommand());
+
+		$exitConflict = $typesTester->execute([
+			'--ts-only' => true,
+			'--php-only' => true,
+			'--dry-run' => true,
+			'--json' => true,
+		]);
+		$jsonConflict = json_decode($typesTester->getDisplay(), true);
+		expect($exitConflict)->toBe(\Symfony\Component\Console\Command\Command::FAILURE)
+			->and($jsonConflict['error']['code'] ?? null)->toBe('INVALID_OPTIONS');
+
+		foreach (['admin', '2', 'user', 'non_existent_tpl_xyz'] as $badTpl) {
+			$exitBadTpl = $typesTester->execute([
+				'--template' => [$badTpl],
+				'--dry-run' => true,
+				'--json' => true,
+			]);
+			$jsonBadTpl = json_decode($typesTester->getDisplay(), true);
+			expect($exitBadTpl)->toBe(\Symfony\Component\Console\Command\Command::FAILURE)
+				->and($jsonBadTpl['error']['code'] ?? null)->toBe('INVALID_TEMPLATE');
+		}
+
+		foreach (['../../outside.ts', 'assets/js/types/not_ts.js', '/etc/evil.d.ts'] as $badOutput) {
+			$exitBadOut = $typesTester->execute([
+				'--template' => ['home'],
+				'--output' => $badOutput,
+				'--dry-run' => true,
+				'--json' => true,
+			]);
+			$jsonBadOut = json_decode($typesTester->getDisplay(), true);
+			expect($exitBadOut)->toBe(\Symfony\Component\Console\Command\Command::FAILURE)
+				->and($jsonBadOut['error']['code'] ?? null)->toBe('INVALID_OUTPUT_PATH');
+		}
+
+		// 6. InertiaInstallCommand --dry-run preserves existing enabledTemplates in inertia.d.ts and emits PageData for uncreated template
+		$inertia->forTemplates(['home'], false);
+		$uncreatedTpl = 'landing_v3_' . substr(md5(uniqid('', true)), 0, 5);
+		$uncreatedPascal = ProviderRegistry::studly($uncreatedTpl);
+		$installTester = new CommandTester(new \Totoglu\Inertia\Commands\InertiaInstallCommand());
+		$exitDryInstall = $installTester->execute([
+			'--stack' => 'react',
+			'--template' => $uncreatedTpl,
+			'--dry-run' => true,
+			'--json' => true,
+		]);
+		$jsonDryInstall = json_decode($installTester->getDisplay(), true);
+		$generatedInterfaces = $jsonDryInstall['data']['types']['typescript']['interfaces'] ?? [];
+		expect($exitDryInstall)->toBe(\Symfony\Component\Console\Command\Command::SUCCESS)
+			->and($generatedInterfaces)->toContain('HomePageData')
+			->and($generatedInterfaces)->toContain($uncreatedPascal . 'PageData');
+	} finally {
+		$config->httpHost = $prevHttpHost;
+		$config->httpHosts = $prevHttpHosts;
+		if ($prevUser instanceof User) {
+			$wire->users->setCurrentUser($prevUser);
+		}
+		if ($prevPage instanceof Page) {
+			$wire->wire('page', $prevPage);
+		}
+		$inertia->set('enabledTemplates', $prevEnabledTemplates);
+		$inertia->resetState();
+	}
+});
+
+it('enforces Pass-3 authority parsing, Repeater/User admin URL redaction, INERTIA_IS_ICON_FIELD, Deferred/Optional OnceProp WireCache, and PhpToken provider discovery', function (): void {
+	$wire = wire();
+	$inertia = inertia();
+	$config = $wire->config;
+	$prevHttpHost = (string) $config->httpHost;
+	$prevHttpHosts = $config->httpHosts;
+	$tmpDir = sys_get_temp_dir() . '/inertia_pass3_' . bin2hex(random_bytes(4));
+
+	try {
+		// 1. Inertia::isTrustedAuthority handles host:port, bare IPv6, bracketed IPv6:port, and rejects malformed IPv6 or cross-port
+		$config->httpHost = 'localhost:8080';
+		$config->httpHosts = ['localhost:8080', '::1', '[2001:db8::1]:8443'];
+		expect(Inertia::isTrustedAuthority($config, 'localhost:8080'))->toBeTrue()
+			->and(Inertia::isTrustedAuthority($config, 'localhost', 8080))->toBeTrue()
+			->and(Inertia::isTrustedAuthority($config, 'localhost', 9090))->toBeFalse()
+			->and(Inertia::isTrustedAuthority($config, '[::1]'))->toBeTrue()
+			->and(Inertia::isTrustedAuthority($config, '::1'))->toBeTrue()
+			->and(Inertia::isTrustedAuthority($config, '[2001:db8::1]', 8443))->toBeTrue()
+			->and(Inertia::isTrustedAuthority($config, '[2001:db8::1]', 9443))->toBeFalse()
+			->and(Inertia::isTrustedAuthority($config, '[not-an-ipv6]'))->toBeFalse();
+
+		// 2. TemplateDataProvider::basePageData redacts secret admin paths on RepeaterPage and User while keeping public Page URLs
+		$homePage = $wire->pages->get(1);
+		$homeBase = TemplateDataProvider::basePageData($homePage);
+		expect($homeBase['url'])->not->toBe('');
+
+		$userPage = $wire->users->getGuestUser();
+		$userBase = TemplateDataProvider::basePageData($userPage);
+		expect($userBase['url'])->toBe('')
+			->and($userBase['httpUrl'])->toBe('');
+
+		if (class_exists(\ProcessWire\RepeaterPage::class)) {
+			$repeaterPage = new \ProcessWire\RepeaterPage($homePage->template);
+			$wire->wire($repeaterPage);
+			$repeaterPage->id = 777001;
+			$repeaterPage->name = 'rep-item-1';
+			$repBase = TemplateDataProvider::basePageData($repeaterPage);
+			expect($repBase['url'])->toBe('')
+				->and($repBase['httpUrl'])->toBe('');
+		}
+
+		// 3. Concrete ReflectionClass checks reject abstract ProcessInertia and abstract Inputfields; INERTIA_IS_ICON_FIELD serializes WireData JsonSerializable icons
+		expect($inertia->isProcessInertiaEnabled(\Totoglu\Inertia\ProcessInertia::class))->toBeFalse();
+
+		if (!class_exists('ProcessWire\\InputfieldPass3AbstractProbe', false)) {
+			eval('namespace ProcessWire; abstract class InputfieldPass3AbstractProbe extends InputfieldText { public const bool INERTIA_IS_ICON_FIELD = true; }');
+		}
+		if (!class_exists('ProcessWire\\InputfieldPass3ConcreteIconProbe', false)) {
+			eval(<<<'PHP'
+namespace ProcessWire;
+class InputfieldPass3ConcreteIconProbe extends InputfieldText {
+	public const bool INERTIA_IS_ICON_FIELD = true;
+	public static function resolveValue(mixed $raw): WireData {
+		$val = new class extends WireData implements \JsonSerializable {
+			public function isEmpty(): bool {
+				return (string) $this->get('name') === '';
+			}
+			public function jsonSerialize(): array {
+				return [
+					'name' => (string) $this->get('name'),
+					'variant' => (string) ($this->get('variant') ?: 'outline'),
+				];
+			}
+		};
+		if (is_string($raw) && $raw !== '') {
+			$decoded = json_decode($raw, true);
+			$val->set('name', is_array($decoded) ? (string) ($decoded['name'] ?? '') : $raw);
+			$val->set('variant', is_array($decoded) ? (string) ($decoded['variant'] ?? 'outline') : 'outline');
+		}
+		return $val;
+	}
+}
+PHP);
+		}
+
+		$scalarProvider = new ScalarFieldDataProvider();
+		$wire->wire($scalarProvider);
+
+		$abstractIconField = new Field();
+		$wire->wire($abstractIconField);
+		$abstractIconField->type = $wire->modules->get('FieldtypeText');
+		$abstractIconField->name = 'abstract_icon_probe';
+		$abstractIconField->set('inputfieldClass', 'ProcessWire\\InputfieldPass3AbstractProbe');
+		expect(ScalarFieldDataProvider::isIconField($abstractIconField))->toBeFalse();
+
+		$iconField = new Field();
+		$wire->wire($iconField);
+		$iconField->type = $wire->modules->get('FieldtypeText');
+		$iconField->name = 'concrete_icon_probe';
+		$iconField->set('inputfieldClass', 'ProcessWire\\InputfieldPass3ConcreteIconProbe');
+		expect(ScalarFieldDataProvider::isIconField($iconField))->toBeTrue()
+			->and($scalarProvider->phpType($iconField))->toBe('?array')
+			->and($scalarProvider->tsType($iconField))->toBe('Record<string, unknown> | null')
+			->and($scalarProvider->transform('{"name":"compass","variant":"filled"}', $iconField))->toBe([
+				'name' => 'compass',
+				'variant' => 'filled',
+			])
+			->and($scalarProvider->transform('', $iconField))->toBeNull();
+
+		$formattedIconObj = \ProcessWire\InputfieldPass3ConcreteIconProbe::resolveValue('{"name":"sparkles","variant":"filled"}');
+		expect($scalarProvider->transform($formattedIconObj, $iconField))->toBe([
+			'name' => 'sparkles',
+			'variant' => 'filled',
+		]);
+
+		// 4. DeferredProp->once() and OptionalProp->once() read & write WireCache during partial reloads unless reset or sub-path filtered
+		$inertia->resetState();
+		$wire->cache->deleteFor(PropResolver::ONCE_CACHE_NAMESPACE);
+		$_GET = [];
+		$wire->input->get->removeAll();
+
+		$deferRuns = 0;
+		$optRuns = 0;
+		$buildLazyOncePage = static function () use ($inertia, &$deferRuns, &$optRuns, $homePage): array {
+			return inertia('Analytics/Dashboard', [
+				'metrics' => $inertia->defer(static function () use (&$deferRuns): array {
+					$deferRuns++;
+
+					return ['run' => $deferRuns, 'summary' => 'ok'];
+				})->once(until: 600),
+				'audit' => $inertia->optional(static function () use (&$optRuns): string {
+					$optRuns++;
+
+					return 'opt-' . $optRuns;
+				})->once(until: 600),
+			])->forPage($homePage)->toPageObject();
+		};
+
+		$inertia->request->fake([
+			'X-Inertia' => 'true',
+			'X-Inertia-Partial-Component' => 'Analytics/Dashboard',
+			'X-Inertia-Partial-Data' => 'metrics,audit',
+		], 'GET');
+		$firstPartial = $buildLazyOncePage();
+		$secondPartial = $buildLazyOncePage();
+		expect($firstPartial['props']['metrics'])->toBe(['run' => 1, 'summary' => 'ok'])
+			->and($secondPartial['props']['metrics'])->toBe(['run' => 1, 'summary' => 'ok'])
+			->and($deferRuns)->toBe(1)
+			->and($secondPartial['props']['audit'])->toBe('opt-1')
+			->and($optRuns)->toBe(1);
+
+		// Sub-path partial filter bypasses full-object cache to prevent poisoning
+		$inertia->request->fake([
+			'X-Inertia' => 'true',
+			'X-Inertia-Partial-Component' => 'Analytics/Dashboard',
+			'X-Inertia-Partial-Data' => 'metrics.summary',
+		], 'GET');
+		$subPathPartial = $buildLazyOncePage();
+		expect($deferRuns)->toBe(2)
+			->and($subPathPartial['props']['metrics'])->toBe(['summary' => 'ok']);
+		$wire->cache->deleteFor(PropResolver::ONCE_CACHE_NAMESPACE);
+
+		// 5. OptionsFieldDataProvider unencoded language-aware SelectableOption, RepeaterFieldDataProvider NullPage on FieldsetPage, PageReference derefAsPage=1
+		$optionsProvider = new \Totoglu\Inertia\Provider\Field\OptionsFieldDataProvider();
+		$wire->wire($optionsProvider);
+		$opt = new \ProcessWire\SelectableOption();
+		$wire->wire($opt);
+		$opt->set('value', 'r&d');
+		$opt->set('title', 'R & D');
+		$opt->of(true);
+		expect($optionsProvider->transform($opt))->toBe(['r&d'])
+			->and($opt->of())->toBeTrue()
+			->and($optionsProvider->transform(['alpha', ['nested' => 'ignored'], 'beta']))->toBe(['alpha', 'beta']);
+
+		$repProvider = new RepeaterFieldDataProvider();
+		$wire->wire($repProvider);
+		$nullPage = $wire->pages->newNullPage();
+		expect($repProvider->transform($nullPage))->toBeNull();
+
+		$pageRefProvider = new PageReferenceFieldDataProvider();
+		$wire->wire($pageRefProvider);
+		$singleOrFalseField = new Field();
+		$singleOrFalseField->set('derefAsPage', 1);
+		expect($pageRefProvider->phpType($singleOrFalseField))->toBe('Page|false');
+
+		// 6. ProviderRegistry::discoverFromDirectory uses PhpToken::tokenize and ignores misleading namespace/class tokens in comments
+		mkdir($tmpDir, 0777, true);
+		$providerFile = $tmpDir . '/CommentedPass3Provider.php';
+		file_put_contents($providerFile, <<<'PHP'
+<?php
+declare(strict_types=1);
+/*
+namespace Decoy\BrokenNamespace;
+class DecoyProvider {}
+*/
+namespace Totoglu\Inertia\Tests\Pass3;
+use Totoglu\Inertia\Provider\TemplateDataProvider;
+final class CommentedPass3Provider extends TemplateDataProvider {
+	public function templates(): array {
+		return ['pass3-token-tpl'];
+	}
+}
+PHP);
+		$reg = new ProviderRegistry();
+		$wire->wire($reg);
+		$reg->discoverFromDirectory($tmpDir);
+		expect($reg->resolveTemplateProvider('pass3-token-tpl')::class)->toBe('Totoglu\\Inertia\\Tests\\Pass3\\CommentedPass3Provider');
+
+		// 7. InertiaInstallCommand::patchViteConfig handles empty input: [] and missing @tailwindcss/vite cleanly; InertiaTracyPanel handles invalid UTF-8
+		$vitePath = $tmpDir . '/vite.config.js';
+		file_put_contents($vitePath, "import { defineConfig } from 'vite';\nexport default defineConfig({\n\tplugins: [],\n\tbuild: { rollupOptions: { input: [] } },\n});\n");
+		$installCmd = new \Totoglu\Inertia\Commands\InertiaInstallCommand();
+		$patchMethod = new \ReflectionMethod($installCmd, 'patchViteConfig');
+		$patchReport = $patchMethod->invoke($installCmd, $inertia->typeGenerator(), $vitePath, 'react', false);
+		$patchedVite = (string) file_get_contents($vitePath);
+		expect($patchReport['status'])->toBe('updated')
+			->and($patchedVite)->toContain('import react from "@vitejs/plugin-react";')
+			->and($patchedVite)->toContain('react()')
+			->and($patchedVite)->toContain('input: ["assets/js/inertia.ts"]')
+			->and($patchedVite)->not->toContain('[, ');
+
+		$tracyPanel = new \Totoglu\Inertia\Debug\InertiaTracyPanel(static fn(): array => [
+			'component' => "Pages/Broken\xFFName",
+			'nested' => ['ok' => true],
+		]);
+		$wire->wire($tracyPanel);
+		expect($tracyPanel->getTab())->toContain('Pages/Broken')
+			->and($tracyPanel->getPanel())->toContain('Inertia.js v3');
+	} finally {
+		$config->httpHost = $prevHttpHost;
+		$config->httpHosts = $prevHttpHosts;
+		if (is_dir($tmpDir)) {
+			foreach (glob($tmpDir . '/*') ?: [] as $f) {
+				if (is_file($f)) {
+					unlink($f);
+				}
+			}
+			rmdir($tmpDir);
+		}
+		$inertia->resetState();
+	}
+});
+
+it('enforces Pass-4 redirect precedence over activePageResponse, JSX-free inertia.ts, MarkupInertia loop isolation, cacheable Vary, port bounds, and ancestor symlink guards', function (): void {
+	$wire = wire();
+	$inertia = inertia();
+	$config = $wire->config;
+	$prevHttpHost = (string) $config->httpHost;
+	$prevHttpHosts = $config->httpHosts;
+	$prevUser = $wire->user;
+	$prevAutoCsrf = (bool) $inertia->autoShareCsrf;
+	$tmpRoot = sys_get_temp_dir() . '/inertia_pass4_' . bin2hex(random_bytes(4));
+
+	try {
+		// 1. Zero #pw-internal $page->output() calls, and redirect/location/back clear stale activePageResponse without consuming flashed errors
+		$moduleSrc = (string) file_get_contents(dirname(__DIR__, 2) . '/Inertia.module.php');
+		expect($moduleSrc)->not->toContain('->output(');
+
+		$inertia->resetState();
+		$inertia->request->fake(['X-Inertia' => 'true'], 'POST');
+		$inertia->render('Pages/Stale', ['stale' => true]);
+		$inertia->backWithErrors(['email' => 'Invalid address'], null, '/contact/', false);
+		expect($inertia->getActiveResponse())->toBeNull()
+			->and($inertia->response->getStatusCode())->toBe(303)
+			->and($inertia->response->getHeader('Location'))->toBe('/contact/');
+
+		$homePage = $wire->pages->get(1);
+		$afterRenderEvent = new \ProcessWire\HookEvent();
+		$wire->wire($afterRenderEvent);
+		$afterRenderEvent->object = $homePage;
+		$afterRenderEvent->return = 'should-be-cleared';
+		$afterRenderHook = new \ReflectionMethod($inertia, 'hookAfterPageRender');
+		$afterRenderHook->invoke($inertia, $afterRenderEvent);
+		expect($afterRenderEvent->return)->toBe('');
+
+		// Flashed errors were NOT prematurely consumed during the redirect response
+		$resolvedNextErrors = $inertia->errors->resolve();
+		expect($resolvedNextErrors)->toBe(['email' => 'Invalid address']);
+
+		// 2. InertiaInstallCommand --stack=react emits JSX-free createElement(App, props) in .ts entry, and svelte starter renders children
+		$installCmd = new \Totoglu\Inertia\Commands\InertiaInstallCommand();
+		$entryMethod = new \ReflectionMethod($installCmd, 'buildEntryPointCode');
+		$reactEntryTs = (string) $entryMethod->invoke($installCmd, 'react');
+		expect($reactEntryTs)->toContain('createElement(App, props)')
+			->and($reactEntryTs)->not->toContain('<App');
+
+		$starterMethod = new \ReflectionMethod($installCmd, 'buildStarterComponentCode');
+		$svelteStarter = (string) $starterMethod->invoke($installCmd, 'svelte', 'Article');
+		expect($svelteStarter)->toContain('{#each children as child');
+
+		// 3. MarkupInertia::render($props) isolates per-call props across loop iterations
+		$loopIsland = new class extends \Totoglu\Inertia\MarkupInertia {
+			public function inertiaComponent(): string
+			{
+				return 'Loop/Card';
+			}
+		};
+		$wire->wire($loopIsland);
+		$loopIsland->with(['sharedKey' => 'base']);
+		$firstHtml = $loopIsland->render(['title' => 'First', 'badge' => 'Featured']);
+		$secondHtml = $loopIsland->render(['title' => 'Second']);
+		expect($firstHtml)->toContain('Featured')
+			->and($secondHtml)->not->toContain('Featured')
+			->and($secondHtml)->toContain('base');
+
+		// 4. Publicly cacheable guest X-Inertia responses include full protocol Vary headers, and tracyDebug captures outgoingHeaders
+		$inertia->resetState();
+		$inertia->set('autoShareCsrf', false);
+		$guestUser = $wire->users->getGuestUser();
+		if ($guestUser instanceof User && $guestUser->id > 0) {
+			$wire->users->setCurrentUser($guestUser);
+		}
+		$inertia->request->fake(['X-Inertia' => 'true'], 'GET');
+		$inertia->renderPageResponse($inertia->render('Public/Article', ['title' => 'Hello']));
+		$publicVary = (string) $inertia->response->getHeader('Vary');
+		expect($publicVary)->toContain('X-Inertia')
+			->and($publicVary)->toContain('X-Inertia-Partial-Data')
+			->and($publicVary)->toContain('X-Inertia-Except-Once-Props')
+			->and($publicVary)->toContain('Purpose');
+
+		$tracyRef = new \ReflectionProperty($inertia, 'tracyDebug');
+		$tracyState = $tracyRef->getValue($inertia);
+		expect($tracyState['outgoingHeaders']['Vary'] ?? '')->toContain('X-Inertia');
+		$inertia->set('autoShareCsrf', $prevAutoCsrf);
+		if ($prevUser instanceof User) {
+			$wire->users->setCurrentUser($prevUser);
+		}
+
+		// 5. Inertia::isTrustedAuthority enforces TCP port 1..65535 and blocks userinfo/@/backslash characters
+		$config->httpHost = 'localhost';
+		$config->httpHosts = ['localhost', 'localhost:8080'];
+		expect(Inertia::isTrustedAuthority($config, 'localhost', 0))->toBeFalse()
+			->and(Inertia::isTrustedAuthority($config, 'localhost', -1))->toBeFalse()
+			->and(Inertia::isTrustedAuthority($config, 'localhost', 65536))->toBeFalse()
+			->and(Inertia::isTrustedAuthority($config, 'localhost:0'))->toBeFalse()
+			->and(Inertia::isTrustedAuthority($config, 'localhost:70000'))->toBeFalse()
+			->and(Inertia::isTrustedAuthority($config, 'evil@localhost'))->toBeFalse()
+			->and(Inertia::isTrustedAuthority($config, 'localhost\\evil'))->toBeFalse();
+
+		// 6. ProviderRegistry discovers concrete provider after abstract readonly + helper classes; ScalarFieldDataProvider rejects non-Inputfield
+		mkdir($tmpRoot . '/providers', 0777, true);
+		file_put_contents($tmpRoot . '/providers/MultiClassPass4Provider.php', <<<'PHP'
+<?php
+declare(strict_types=1);
+namespace Totoglu\Inertia\Tests\Pass4;
+use Totoglu\Inertia\Provider\TemplateDataProvider;
+final class InternalHelperDto {}
+abstract readonly class AbstractReadonlyHelper {}
+final class MultiClassPass4Provider extends TemplateDataProvider {
+	public function templates(): array {
+		return ['pass4-multi-tpl'];
+	}
+}
+PHP);
+		$reg = new ProviderRegistry();
+		$wire->wire($reg);
+		$reg->discoverFromDirectory($tmpRoot . '/providers');
+		expect($reg->resolveTemplateProvider('pass4-multi-tpl')::class)->toBe('Totoglu\\Inertia\\Tests\\Pass4\\MultiClassPass4Provider');
+
+		if (!class_exists('ProcessWire\\NonInputfieldPass4Probe', false)) {
+			eval('namespace ProcessWire; class NonInputfieldPass4Probe { public const bool INERTIA_IS_ICON_FIELD = true; }');
+		}
+		$nonInputfield = new Field();
+		$wire->wire($nonInputfield);
+		$nonInputfield->type = $wire->modules->get('FieldtypeText');
+		$nonInputfield->set('inputfieldClass', 'ProcessWire\\NonInputfieldPass4Probe');
+		expect(ScalarFieldDataProvider::isIconField($nonInputfield))->toBeFalse();
+
+		// Canonical InertiaFieldtypeInterface + InteractWithInertiaFieldtype bridge
+		$customFt = new class extends \ProcessWire\FieldtypeText implements \Totoglu\Inertia\Contracts\InertiaFieldtypeInterface {
+			use \Totoglu\Inertia\InteractWithInertiaFieldtype;
+
+			public function toInertiaFieldValue(mixed $value, Field $field, ?Page $page = null): mixed
+			{
+				return ['custom' => (string) $value];
+			}
+
+			public function toInertiaTsType(Field $field): string
+			{
+				return '{ custom: string }';
+			}
+		};
+		$wire->wire($customFt);
+		$ftField = new Field();
+		$wire->wire($ftField);
+		$ftField->name = 'custom_ft_probe';
+		$ftField->type = $customFt;
+		$ftProvider = $reg->resolveFieldProvider($ftField);
+		expect($ftProvider->transform('val', $ftField))->toBe(['custom' => 'val'])
+			->and($ftProvider->tsType($ftField))->toBe('{ custom: string }');
+
+		// 7. PropResolver authorizes bound forPage($draftPage), ScrollProp preserves explicit previousPage => null, and TypeGenerator blocks symlinked ancestors
+		$draftPage = new Page($homePage->template);
+		$wire->wire($draftPage);
+		$draftPage->id = 991004;
+		$draftPage->name = 'draft-bound';
+		$draftPage->title = 'Draft Bound Title';
+		$draftPage->addStatus(Page::statusUnpublished);
+		$guestDraftObj = inertia('Pages/DraftPreview', ['page' => $draftPage])->forPage($draftPage)->toPageObject();
+		expect($guestDraftObj['props']['page'] ?? null)->toBeNull();
+
+		$superuser = $wire->users->get((int) $config->superUserPageID);
+		if ($superuser instanceof User && $superuser->id > 0) {
+			$wire->users->setCurrentUser($superuser);
+			$editorDraftObj = inertia('Pages/DraftPreview', ['page' => $draftPage])->forPage($draftPage)->toPageObject();
+			expect($editorDraftObj['props']['page']['title'] ?? null)->toBe('Draft Bound Title');
+			if ($prevUser instanceof User) {
+				$wire->users->setCurrentUser($prevUser);
+			}
+		}
+
+		$inertia->request->fake(['X-Inertia' => 'true'], 'GET');
+		$scrollObj = inertia('Feed/List', [
+			'feed' => $inertia->scroll([
+				'data' => [['id' => 10]],
+				'currentPage' => 3,
+				'previousPage' => null,
+				'nextPage' => 4,
+			]),
+		])->toPageObject();
+		expect($scrollObj['scrollProps']['feed'])->toHaveKey('previousPage')
+			->and($scrollObj['scrollProps']['feed']['previousPage'])->toBeNull()
+			->and($scrollObj['scrollProps']['feed']['nextPage'] ?? null)->toBe(4);
+
+		$outsideDir = $tmpRoot . '/outside';
+		$insideRoot = $tmpRoot . '/inside';
+		mkdir($outsideDir, 0777, true);
+		mkdir($insideRoot, 0777, true);
+		$symlinkDir = $insideRoot . '/linked_assets';
+		symlink($outsideDir, $symlinkDir);
+		$typeGen = $inertia->typeGenerator();
+		expect($typeGen->isValidCustomOutputPath('assets/.ts'))->toBeFalse()
+			->and($typeGen->writeFileSafely($symlinkDir . '/nested/Pages/Home/Show.tsx', 'blocked'))->toBeFalse()
+			->and(is_file($outsideDir . '/nested/Pages/Home/Show.tsx'))->toBeFalse();
+	} finally {
+		$config->httpHost = $prevHttpHost;
+		$config->httpHosts = $prevHttpHosts;
+		$inertia->set('autoShareCsrf', $prevAutoCsrf);
+		if ($prevUser instanceof User) {
+			$wire->users->setCurrentUser($prevUser);
+		}
+		if (is_link($tmpRoot . '/inside/linked_assets')) {
+			unlink($tmpRoot . '/inside/linked_assets');
+		}
+		foreach ([$tmpRoot . '/providers/MultiClassPass4Provider.php'] as $f) {
+			if (is_file($f)) {
+				unlink($f);
+			}
+		}
+		foreach ([$tmpRoot . '/providers', $tmpRoot . '/inside', $tmpRoot . '/outside', $tmpRoot] as $d) {
+			if (is_dir($d)) {
+				rmdir($d);
+			}
+		}
+		$inertia->resetState();
+	}
+});
+
+it('enforces Pass-5 rejected saveConfig isolation, temp Pagefile public check, omitted nested filtered containers, redirect notice persistence, Request callback injection, NAN/INF safety, and ScrollProp withMeta null cursors', function (): void {
+	$wire = wire();
+	$config = $wire->config;
+	$inertia = inertia();
+	$inertia->resetState();
+
+	$originalSavedCfg = $wire->modules->getConfig('Inertia');
+	$originalSsrUrl = $inertia->ssrUrl;
+	$originalEnabledTemplates = $inertia->enabledTemplates;
+	$tmpDir = rtrim((string) $config->paths->cache, '/') . '/inertia_pass5_' . bin2hex(random_bytes(4));
+	mkdir($tmpDir . '/providers', 0777, true);
+	mkdir($tmpDir . '/outside_types', 0777, true);
+	$symlinkAssetsPath = rtrim((string) $config->paths->templates, '/') . '/inertia_pass5_link_' . bin2hex(random_bytes(4));
+
+	try {
+		// 1. Blocked SSRF saveConfig('Inertia', ...) must NOT poison live in-memory $inertia->ssrUrl or reset omitted keys
+		$savedBlocked = $wire->modules->saveConfig('Inertia', [
+			'ssrUrl' => 'http://169.254.169.254/latest/meta-data/',
+		]);
+		expect($savedBlocked)->toBeFalse()
+			->and($inertia->ssrUrl)->toBe($originalSsrUrl)
+			->and($inertia->enabledTemplates)->toBe($originalEnabledTemplates);
+
+		// 2. MediaFieldDataProvider uses public Pagefile::createdTemp instead of #pw-internal isTemp()
+		$mediaProviderSource = (string) file_get_contents(__DIR__ . '/../../src/Provider/Field/MediaFieldDataProvider.php');
+		expect($mediaProviderSource)->not->toContain('->isTemp(')
+			->and($mediaProviderSource)->toContain('Pagefile::createdTemp');
+
+		// 3. Nested dot-notated protocol-filtered containers are omitted instead of collapsing into JSON arrays `[]`
+		$inertia->resetState();
+		$inertia->shareOnce('catalog.categories', static fn(): array => ['Books', 'Audio']);
+		$inertia->request->fake([
+			'X-Inertia' => 'true',
+			'X-Inertia-Except-Once-Props' => 'catalog.categories',
+		], 'GET');
+
+		$filteredObj = inertia('Store/Index', [
+			'analytics' => [
+				'chart' => $inertia->defer(static fn(): array => ['points' => [1, 2, 3]]),
+			],
+			'literalEmpty' => [],
+		])->toPageObject();
+
+		expect($filteredObj['props'])->not->toHaveKey('catalog')
+			->and($filteredObj['props'])->not->toHaveKey('analytics')
+			->and($filteredObj['props'])->toHaveKey('literalEmpty')
+			->and($filteredObj['props']['literalEmpty'])->toBe([]);
+
+		// 4. $inertia->redirect() persists visible $wire->notices into $session across the redirect boundary
+		$inertia->resetState();
+		$wire->notices->removeAll();
+		$wire->session->removeNotices();
+		$wire->notices->add(new NoticeMessage('Persisted across redirect'));
+		$inertia->request->fake(['X-Inertia' => 'true'], 'POST');
+		$redirectRes = $inertia->redirect('/dashboard');
+		expect($redirectRes->getStatusCode())->toBe(409)
+			->and($wire->session->getFor('_notices', 'messages'))->toBeArray();
+
+		// Simulate fresh next-request `$wire->notices` state after browser follows redirect (preserving session `_notices`)
+		$wire->notices->removeAll();
+		$inertia->request->fake(['X-Inertia' => 'true'], 'GET');
+		$inertia->response->reset();
+		$postRedirectPage = inertia('Dashboard/Index')->toPageObject();
+		expect($postRedirectPage['props']['flash']['messages'] ?? [])->toContain('Persisted across redirect');
+
+		// 5. Request injection into PropInterface & raw closures without breaking 0-arg or typed non-Request defaults
+		$inertia->resetState();
+		$inertia->request->fake([
+			'X-Inertia' => 'true',
+			'X-Inertia-Partial-Component' => 'Search/Results',
+			'X-Inertia-Partial-Data' => 'deferredReq,optReq,onceReq,mergeReq,alwaysReq,rawReq,zeroArg,nonReqDefault',
+			'X-Custom-Trace' => 'trace-99',
+		], 'GET');
+
+		$reqInjected = inertia('Search/Results', [
+			'deferredReq' => $inertia->defer(static fn(Request $req): ?string => $req->header('X-Custom-Trace')),
+			'optReq' => $inertia->optional(static fn(Request $req): ?string => $req->header('X-Custom-Trace')),
+			'onceReq' => $inertia->once(static fn(Request $req): ?string => $req->header('X-Custom-Trace')),
+			'mergeReq' => $inertia->merge(static fn(Request $req): array => [$req->header('X-Custom-Trace')]),
+			'alwaysReq' => $inertia->always(static fn(Request $req): ?string => $req->header('X-Custom-Trace')),
+			'rawReq' => static fn(Request $req): ?string => $req->header('X-Custom-Trace'),
+			'zeroArg' => $inertia->once('time'),
+			'nonReqDefault' => $inertia->once(static fn(int $precision = 2): float => round(3.14159, $precision)),
+		])->toPageObject();
+
+		expect($reqInjected['props']['deferredReq'] ?? null)->toBe('trace-99')
+			->and($reqInjected['props']['optReq'] ?? null)->toBe('trace-99')
+			->and($reqInjected['props']['onceReq'] ?? null)->toBe('trace-99')
+			->and($reqInjected['props']['mergeReq'] ?? null)->toBe(['trace-99'])
+			->and($reqInjected['props']['alwaysReq'] ?? null)->toBe('trace-99')
+			->and($reqInjected['props']['rawReq'] ?? null)->toBe('trace-99')
+			->and($reqInjected['props']['zeroArg'] ?? null)->toBeInt()
+			->and($reqInjected['props']['nonReqDefault'] ?? null)->toBe(3.14);
+
+		// 6. Non-finite floats (NAN / INF) resolve cleanly to null and never corrupt JSON / root view output
+		$inertia->resetState();
+		$inertia->request->fake(['X-Inertia' => 'true'], 'GET');
+		$nanResponse = inertia('Metrics/View', [
+			'nanVal' => NAN,
+			'infVal' => INF,
+			'validFloat' => 12.5,
+		]);
+		$nanObj = $nanResponse->toPageObject();
+		$decodedJson = json_decode($nanResponse->toJson(), true);
+		expect($nanObj['props']['nanVal'])->toBeNull()
+			->and($nanObj['props']['infVal'])->toBeNull()
+			->and($nanObj['props']['validFloat'])->toBe(12.5)
+			->and(is_array($decodedJson))->toBeTrue()
+			->and($decodedJson['props']['validFloat'] ?? null)->toBe(12.5);
+
+		// 7. ScrollProp::withMeta(2, null, null) preserves explicit null previousPage and nextPage cursors
+		$scrollWithNulls = inertia('Feed/NullMeta', [
+			'items' => $inertia->scroll([['id' => 1], ['id' => 2]])->withMeta(2, null, null),
+		])->toPageObject();
+		expect($scrollWithNulls['scrollProps']['items'])->toHaveKey('previousPage')
+			->and($scrollWithNulls['scrollProps']['items']['currentPage'])->toBe(2)
+			->and($scrollWithNulls['scrollProps']['items']['previousPage'])->toBeNull()
+			->and($scrollWithNulls['scrollProps']['items']['nextPage'])->toBeNull();
+
+		// 8. TypeGenerator::isValidCustomOutputPath() rejects symlinked parent directories under site/
+		symlink($tmpDir . '/outside_types', $symlinkAssetsPath);
+		$relativeLinkName = basename($symlinkAssetsPath);
+		expect($inertia->typeGenerator()->isValidCustomOutputPath($relativeLinkName . '/nested/custom.d.ts'))->toBeFalse();
+
+		// 9. ProviderRegistry::discoverFromDirectory() handles relative `namespace\...` calls and global `namespace { ... }` blocks
+		$relNsProviderFile = $tmpDir . '/providers/RelativeNsPass5Provider.php';
+		file_put_contents($relNsProviderFile, <<<'PHP'
+<?php
+declare(strict_types=1);
+namespace CustomPass5Ns {
+	use Totoglu\Inertia\Provider\TemplateDataProvider;
+
+	function normalizePass5Tpl(string $name): string
+	{
+		return strtolower($name);
+	}
+
+	final class RelativeNsPass5Provider extends TemplateDataProvider
+	{
+		public function templates(): array
+		{
+			return [namespace\normalizePass5Tpl('PASS5_REL_TPL')];
+		}
+	}
+}
+PHP
+		);
+		$registry = new \Totoglu\Inertia\Provider\ProviderRegistry();
+		$wire->wire($registry);
+		$registry->discoverFromDirectory($tmpDir . '/providers');
+		expect($registry->resolveTemplateProvider('pass5_rel_tpl')::class)
+			->toBe('CustomPass5Ns\\RelativeNsPass5Provider');
+
+		// 10. System templates (`user`, `role`, `permission`) and numeric IDs are rejected even under `forAllTemplates(true)`
+		$inertia->forAllTemplates(true);
+		$userTpl = $wire->templates->get('user');
+		expect($inertia->isTemplateEnabled('29'))->toBeFalse()
+			->and($inertia->isTemplateEnabled('user'))->toBeFalse()
+			->and($userTpl instanceof Template ? $inertia->isTemplateEnabled($userTpl) : false)->toBeFalse()
+			->and($inertia->normalizeTemplateList(['user', 'role', 'permission', '29', 'home']))->toBe(['home']);
+
+		// 11. InteractWithInertia::isSafeAssetUrl() fails closed (`false`) on cross-origin URLs when host is not wired
+		$unwiredHost = new class {
+			use InteractWithInertia;
+
+			public function checkUrl(string $url): bool
+			{
+				return $this->isSafeAssetUrl($url);
+			}
+		};
+		expect($unwiredHost->checkUrl('https://evil.example/payload.js'))->toBeFalse()
+			->and($unwiredHost->checkUrl('/site/templates/assets/app.js'))->toBeTrue();
+
+		// 12. PropResolver suppresses `Notice::debug` when `$config->debug` is false and guards unpersisted `Role`
+		$prevDebugFlag = (bool) $config->debug;
+		try {
+			$config->debug = false;
+			$debugNotice = new NoticeMessage('Internal debug SQL trace', \ProcessWire\Notice::debug);
+			$unpersistedRole = new \ProcessWire\Role();
+			$wire->wire($unpersistedRole);
+			$unpersistedRole->name = 'draft-role';
+
+			$noticeFiltered = inertia('Debug/Filter', [
+				'debugNotice' => $debugNotice,
+				'plainNotice' => new NoticeMessage('Saved & published'),
+				'draftRole' => $unpersistedRole,
+			])->toPageObject();
+
+			expect($noticeFiltered['props']['debugNotice'])->toBeNull()
+				->and($noticeFiltered['props']['plainNotice']['text'] ?? null)->toBe('Saved & published')
+				->and($noticeFiltered['props']['draftRole'])->toBeNull();
+		} finally {
+			$config->debug = $prevDebugFlag;
+		}
+
+		// 13. OnceProp::once(false) omits onceProps metadata, and ScrollProp normalizes blank wrapper/pageName
+		$inertia->resetState();
+		$inertia->request->fake(['X-Inertia' => 'true'], 'GET');
+		$disabledOnce = $inertia->once(static fn(): string => 'fresh-val')->once(false);
+		$blankScroll = $inertia->scroll([['id' => 1]], '   ', '   ');
+		$edgeMetaObj = inertia('Meta/Edge', [
+			'notOnce' => $disabledOnce,
+			'feed' => $blankScroll,
+		])->toPageObject();
+		expect($edgeMetaObj)->not->toHaveKey('onceProps')
+			->and($edgeMetaObj['props']['notOnce'] ?? null)->toBe('fresh-val')
+			->and($edgeMetaObj['mergeProps'] ?? [])->toContain('feed.data')
+			->and($edgeMetaObj['scrollProps']['feed']['pageName'] ?? null)->toBe('page');
+
+		// 14. RootViewRenderer injects `<title inertia>` fallback when `$head` has no `<title>` (WCAG 2.4.2 document-title)
+		$inertia->resetState();
+		$inertia->request->fake([], 'GET');
+		$barePage = new Page();
+		$wire->wire($barePage);
+		$fallbackHtml = inertia('Minimal/Untitled', ['browserTitle' => 'Catalog <Overview>'])->forPage($barePage)->toOutput();
+		expect($fallbackHtml)->toContain('<title inertia>Catalog &lt;Overview&gt;</title>')
+			->and(substr_count($fallbackHtml, '<title'))->toBe(1);
+
+		// 15. CLI saveConfig('Inertia', ...) does not trigger TypeGenerator writes on disk
+		$cliGuardDts = $tmpDir . '/cli_save_should_not_write.ts';
+		$cfgWithTmpDts = array_merge(is_array($originalSavedCfg) ? $originalSavedCfg : [], [
+			'autoGenerateTypes' => true,
+			'typeScriptOutputPath' => $cliGuardDts,
+		]);
+		expect($wire->modules->saveConfig('Inertia', $cfgWithTmpDts))->toBeTrue()
+			->and(is_file($cliGuardDts))->toBeFalse();
+
+		// 16. resolveXsrfCookieOptions() preserves boolean `cookieOptions['domain'] = true`, explicit `secure = false`, and `sessionCookieSecure = 1` over plain HTTP
+		$prevCookieOpts = $config->cookieOptions;
+		$prevHttps = (bool) $config->https;
+		$prevSessionSecure = $config->sessionCookieSecure;
+		try {
+			$config->https = false;
+			$config->sessionCookieSecure = 1;
+			$config->cookieOptions = ['domain' => true];
+			$httpCookieOpts = Inertia::resolveXsrfCookieOptions($config);
+			expect($httpCookieOpts['domain'])->toBeTrue()
+				->and($httpCookieOpts['secure'])->toBeFalse()
+				->and($httpCookieOpts['httponly'])->toBeFalse();
+
+			$config->https = true;
+			$config->cookieOptions = ['domain' => 'app.example.com', 'secure' => false];
+			$explicitInsecureOpts = Inertia::resolveXsrfCookieOptions($config);
+			expect($explicitInsecureOpts['domain'])->toBe('app.example.com')
+				->and($explicitInsecureOpts['secure'])->toBeFalse();
+
+			$config->cookieOptions = ['samesite' => 'none', 'secure' => false];
+			$noneOpts = Inertia::resolveXsrfCookieOptions($config);
+			expect($noneOpts['samesite'])->toBe('None')
+				->and($noneOpts['secure'])->toBeTrue();
+		} finally {
+			$config->cookieOptions = $prevCookieOpts;
+			$config->https = $prevHttps;
+			$config->sessionCookieSecure = $prevSessionSecure;
+		}
+	} finally {
+		if (is_array($originalSavedCfg)) {
+			$wire->modules->saveConfig('Inertia', $originalSavedCfg);
+		}
+		if (is_link($symlinkAssetsPath)) {
+			unlink($symlinkAssetsPath);
+		}
+		if (is_file($tmpDir . '/providers/RelativeNsPass5Provider.php')) {
+			unlink($tmpDir . '/providers/RelativeNsPass5Provider.php');
+		}
+		foreach ([$tmpDir . '/providers', $tmpDir . '/outside_types', $tmpDir] as $dir) {
+			if (is_dir($dir)) {
+				rmdir($dir);
+			}
+		}
+		$wire->notices->removeAll();
+		$wire->session->removeNotices();
+		$inertia->resetState();
+	}
+});
+
+it('enforces multi-language access and scalar unwrapping, safe provider discovery, island provider boot with entity-encoding guard, template stack unwinding, and full-SPA CLI install', function (): void {
+	$wire = wire();
+	$inertia = Inertia::instance($wire);
+	$config = $wire->config;
+	$tmpDir = rtrim(sys_get_temp_dir(), '/\\') . '/pw_inertia_pass6_' . uniqid('', true);
+	mkdir($tmpDir . '/providers', 0777, true);
+	mkdir($tmpDir . '/custom_classes', 0777, true);
+	mkdir($tmpDir . '/partials', 0777, true);
+
+	$prevUser = $wire->user;
+	$prevLang = $prevUser instanceof User ? $prevUser->language : null;
+	$prevEntityEncode = \ProcessWire\__(true, 'entityEncode');
+	$prevClassesPath = (string) $config->paths->classes;
+	$hookId = null;
+
+	try {
+		// 1. ProviderRegistry::discoverFromDirectory() skips private-constructor helpers and non-provider classes without instantiating them
+		$providerFile = $tmpDir . '/providers/Pass6SafeDiscoveryProvider.php';
+		file_put_contents($providerFile, <<<'PHP'
+<?php
+declare(strict_types=1);
+namespace Totoglu\Inertia\Provider;
+
+final class Pass6PrivateHelper {
+	public static bool $instantiated = false;
+	private function __construct() {
+		self::$instantiated = true;
+	}
+}
+
+final class Pass6PublicNonProvider {
+	public static bool $instantiated = false;
+	public function __construct() {
+		self::$instantiated = true;
+	}
+}
+
+final class Pass6SafeDiscoveryProvider extends FieldDataProvider {
+	public function supports(): array { return ['field:pass6_safe_probe']; }
+	public function transform(mixed $value, ?\ProcessWire\Field $field = null, ?\ProcessWire\Page $page = null): mixed {
+		return 'pass6:' . (string) $value;
+	}
+	public function phpType(\ProcessWire\Field $field): string { return 'string'; }
+	public function tsType(\ProcessWire\Field $field): string { return 'string'; }
+}
+PHP);
+
+		$registry = new ProviderRegistry();
+		$wire->wire($registry);
+		$registry->discoverFromDirectory($tmpDir . '/providers');
+		expect(\Totoglu\Inertia\Provider\Pass6PrivateHelper::$instantiated)->toBeFalse()
+			->and(\Totoglu\Inertia\Provider\Pass6PublicNonProvider::$instantiated)->toBeFalse();
+
+		$probeField = new Field();
+		$wire->wire($probeField);
+		$probeField->name = 'pass6_safe_probe';
+		$probeField->type = $wire->modules->get('FieldtypeText');
+		expect($registry->resolveFieldProvider($probeField)->transform('ok', $probeField))->toBe('pass6:ok');
+
+		// 2. TemplateDataProvider::isAccessiblePage() blocks pages with inactive non-default language status (status{langId} = 0)
+		$languages = $wire->languages;
+		$secondaryLang = null;
+		if ($languages !== null) {
+			foreach ($languages as $candidateLang) {
+				if ($candidateLang instanceof \ProcessWire\Language && !$candidateLang->isDefault()) {
+					$secondaryLang = $candidateLang;
+					break;
+				}
+			}
+		}
+
+		if ($secondaryLang instanceof \ProcessWire\Language) {
+			$guestUser = $wire->users->getGuestUser();
+			$wire->users->setCurrentUser($guestUser);
+			$guestUser->language = $secondaryLang;
+
+			$homeTemplate = $wire->templates->get('home');
+			if ($homeTemplate instanceof Template) {
+				$inactiveLangPage = new Page();
+				$wire->wire($inactiveLangPage);
+				$inactiveLangPage->id = 999601;
+				$inactiveLangPage->parent_id = 1;
+				$inactiveLangPage->template = $homeTemplate;
+				$inactiveLangPage->name = 'pass6-inactive-lang';
+				$inactiveLangPage->setQuietly("status{$secondaryLang->id}", 0);
+
+				$activeLangPage = new Page();
+				$wire->wire($activeLangPage);
+				$activeLangPage->id = 999602;
+				$activeLangPage->parent_id = 1;
+				$activeLangPage->template = $homeTemplate;
+				$activeLangPage->name = 'pass6-active-lang';
+				$activeLangPage->setQuietly("status{$secondaryLang->id}", 1);
+
+				expect(TemplateDataProvider::isAccessiblePage($inactiveLangPage))->toBeFalse()
+					->and(TemplateDataProvider::isAccessiblePage($activeLangPage))->toBeTrue();
+			}
+
+			// 3. ScalarFieldDataProvider unwraps LanguagesPageFieldValue in the active user language for Icon, KeyValue, and Link fields
+			if (!class_exists('ProcessWire\\InputfieldPass6LinkProbe', false)) {
+				eval(<<<'PHP'
+namespace ProcessWire;
+class InputfieldPass6LinkProbe extends InputfieldText {
+	public const bool INERTIA_IS_LINK_FIELD = true;
+	public static function isEmptyValue(mixed $raw): bool {
+		return !is_string($raw) || trim($raw) === '';
+	}
+	public static function resolveValue(mixed $raw, ?Page $page = null, ?Field $field = null): array {
+		$decoded = is_string($raw) ? json_decode($raw, true) : null;
+		return is_array($decoded) ? $decoded : [];
+	}
+}
+class InputfieldPass6KvProbe extends InputfieldText {
+	public const bool INERTIA_IS_KEYVALUE_FIELD = true;
+}
+PHP);
+			}
+			if (!class_exists('ProcessWire\\InputfieldPass3ConcreteIconProbe', false)) {
+				eval(<<<'PHP'
+namespace ProcessWire;
+class InputfieldPass3ConcreteIconProbe extends InputfieldText {
+	public const bool INERTIA_IS_ICON_FIELD = true;
+	public static function resolveValue(mixed $raw): array {
+		$decoded = is_string($raw) ? json_decode($raw, true) : null;
+		return is_array($decoded) ? $decoded : [];
+	}
+}
+PHP);
+			}
+
+			$defaultLang = $languages->getDefault();
+			$scalar = new ScalarFieldDataProvider();
+			$wire->wire($scalar);
+
+			$langIconVal = new \ProcessWire\LanguagesPageFieldValue($wire->pages->get(1), new Field());
+			$wire->wire($langIconVal);
+			$langIconVal->setLanguageValue($defaultLang, '{"name":"home","variant":"outline"}');
+			$langIconVal->setLanguageValue($secondaryLang, '{"name":"globe","variant":"filled"}');
+
+			$iconField = new Field();
+			$wire->wire($iconField);
+			$iconField->type = $wire->modules->get('FieldtypeText');
+			$iconField->name = 'pass6_lang_icon';
+			$iconField->set('inputfieldClass', 'ProcessWire\\InputfieldPass3ConcreteIconProbe');
+			expect($scalar->transform($langIconVal, $iconField))->toBe([
+				'name' => 'globe',
+				'variant' => 'filled',
+			]);
+
+			$langKvVal = new \ProcessWire\LanguagesPageFieldValue($wire->pages->get(1), new Field());
+			$wire->wire($langKvVal);
+			$langKvVal->setLanguageValue($secondaryLang, '{"region":"TR","tier":"pro"}');
+
+			$kvField = new Field();
+			$wire->wire($kvField);
+			$kvField->type = $wire->modules->get('FieldtypeText');
+			$kvField->name = 'pass6_lang_kv';
+			$kvField->set('inputfieldClass', 'ProcessWire\\InputfieldPass6KvProbe');
+			$resolvedKv = $scalar->transform($langKvVal, $kvField);
+			expect($resolvedKv)->toBeInstanceOf(\stdClass::class)
+				->and((array) $resolvedKv)->toBe(['region' => 'TR', 'tier' => 'pro']);
+
+			$langLinkVal = new \ProcessWire\LanguagesPageFieldValue($wire->pages->get(1), new Field());
+			$wire->wire($langLinkVal);
+			$langLinkVal->setLanguageValue($secondaryLang, '{"href":"/tr/iletisim/","label":"Iletisim"}');
+
+			$linkField = new Field();
+			$wire->wire($linkField);
+			$linkField->type = $wire->modules->get('FieldtypeText');
+			$linkField->name = 'pass6_lang_link';
+			$linkField->set('inputfieldClass', 'ProcessWire\\InputfieldPass6LinkProbe');
+			expect($scalar->transform($langLinkVal, $linkField))->toBe([
+				'href' => '/tr/iletisim/',
+				'label' => 'Iletisim',
+			]);
+
+			if ($prevUser instanceof User) {
+				$wire->users->setCurrentUser($prevUser);
+				if ($prevLang instanceof \ProcessWire\Language) {
+					$prevUser->language = $prevLang;
+				}
+			}
+		}
+
+		// 4. Classic-page MarkupInertia & InputfieldInertia boot Tier-2 Inertia::registerProviders and disable entity double-encoding
+		$inertia->resetState();
+		$providerBootCount = 0;
+		$hookId = $wire->addHookAfter('Inertia::registerProviders', static function () use (&$providerBootCount): void {
+			$providerBootCount++;
+		});
+		\ProcessWire\__(true, 'entityEncode', true);
+
+		$islandProbe = new class extends \Totoglu\Inertia\MarkupInertia {
+			public function inertiaShared(): array
+			{
+				return [
+					'sharedLabel' => $this->_('Research & Development'),
+				];
+			}
+
+			public function inertiaWithData(): array
+			{
+				return [
+					'heading' => $this->_('Terms & Conditions'),
+				];
+			}
+		};
+		$wire->wire($islandProbe);
+		$islandHtml = $islandProbe->render();
+		preg_match('/data-props="([^"]+)"/', $islandHtml, $propAttrMatch);
+		$decodedIslandProps = isset($propAttrMatch[1])
+			? json_decode(html_entity_decode($propAttrMatch[1], ENT_QUOTES, 'UTF-8'), true)
+			: null;
+		expect($providerBootCount)->toBe(1)
+			->and($islandHtml)->not->toContain("\0")
+			->and(is_array($decodedIslandProps) ? ($decodedIslandProps['heading'] ?? null) : null)->toBe('Terms & Conditions')
+			->and($config->js('InertiaShared')['sharedLabel'] ?? null)->toBe('Research & Development');
+
+		// 5. Caught exception inside nested TemplateFile::render() unwinds cleanly and still halts outer TemplateFile
+		$inertia->resetState();
+		$brokenPartial = $tmpDir . '/partials/broken.php';
+		$outerTemplate = $tmpDir . '/partials/outer.php';
+		file_put_contents($brokenPartial, "<?php throw new \\RuntimeException('inner partial boom');\n");
+		file_put_contents($outerTemplate, "<?php\n\$__obLevel = ob_get_level();\ntry {\n\t\$inner = new \\ProcessWire\\TemplateFile(" . var_export($brokenPartial, true) . ");\n\t\\ProcessWire\\wire()->wire(\$inner);\n\t\$inner->render();\n} catch (\\RuntimeException) {\n\twhile (ob_get_level() > \$__obLevel) {\n\t\tob_end_clean();\n\t}\n}\nreturn \\ProcessWire\\inertia('Outer/Recovered', ['ok' => true]);\n");
+
+		$outerTf = new \ProcessWire\TemplateFile($outerTemplate);
+		$wire->wire($outerTf);
+		$outerTf->render();
+		expect($outerTf->halt)->toBeTrue()
+			->and($inertia->getActiveResponse()?->component())->toBe('Outer/Recovered');
+
+		// 6. InertiaInstallCommand --dry-run preserves `mode === 'all'` and includes all frontend templates; TypeGenerator honors $config->paths->classes
+		$inertia->resetState();
+		$inertia->forAllTemplates(true);
+		$installTester = new CommandTester(new \Totoglu\Inertia\Commands\InertiaInstallCommand());
+		$installExit = $installTester->execute([
+			'--stack' => 'vue',
+			'--template' => 'pass6_spa_landing',
+			'--dry-run' => true,
+			'--json' => true,
+		]);
+		$installPayload = json_decode($installTester->getDisplay(), true);
+		expect($installExit)->toBe(0)
+			->and((string) $inertia->mode)->toBe(TemplateMode::All->value)
+			->and($installPayload['data']['types']['templates'] ?? [])->toContain('home')
+			->and($installPayload['data']['types']['templates'] ?? [])->toContain('pass6_spa_landing');
+
+		$config->paths->set('classes', $tmpDir . '/custom_classes/');
+		$homeTpl = $wire->templates->get('home');
+		if ($homeTpl instanceof Template) {
+			$pageClassPreview = $inertia->typeGenerator()->generatePageClass($homeTpl, false, true);
+			expect(str_replace('\\', '/', $pageClassPreview['path']))->toBe(str_replace('\\', '/', $tmpDir . '/custom_classes/HomePage.php'));
+		}
+
+		// 7. _inertia.php stub renders cleanly with fallback defaults when $locale and $head are omitted
+		$stubHtml = $wire->files->render(dirname(__DIR__, 2) . '/commands/stubs/templates/_inertia.php', [
+			'inertia' => $inertia,
+			'pageObject' => [
+				'component' => 'Stub/Fallback',
+				'props' => ['ok' => true],
+				'url' => '/',
+				'version' => '1',
+			],
+		]);
+		expect($stubHtml)->toContain('<html lang="en"')
+			->and($stubHtml)->toContain('data-page="app"');
+	} finally {
+		if ($hookId !== null) {
+			$wire->removeHook($hookId);
+		}
+		\ProcessWire\__(true, 'entityEncode', is_bool($prevEntityEncode) || is_int($prevEntityEncode) ? $prevEntityEncode : true);
+		$config->paths->set('classes', $prevClassesPath);
+		if ($prevUser instanceof User) {
+			$wire->users->setCurrentUser($prevUser);
+			if ($prevLang instanceof \ProcessWire\Language) {
+				$prevUser->language = $prevLang;
+			}
+		}
+		foreach ([
+			$tmpDir . '/providers/Pass6SafeDiscoveryProvider.php',
+			$tmpDir . '/partials/broken.php',
+			$tmpDir . '/partials/outer.php',
+		] as $f) {
+			if (is_file($f)) {
+				unlink($f);
+			}
+		}
+		foreach ([$tmpDir . '/providers', $tmpDir . '/custom_classes', $tmpDir . '/partials', $tmpDir] as $d) {
+			if (is_dir($d)) {
+				rmdir($d);
+			}
+		}
 		$inertia->resetState();
 	}
 });

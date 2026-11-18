@@ -1,4 +1,4 @@
-<?php
+<?php // __(file-not-translatable)
 
 declare(strict_types=1);
 
@@ -37,7 +37,7 @@ final class LayeringScanner
 
 	private const array EXCLUDED_DIRECTORIES = ['tests', 'vendor', 'node_modules', '.git', 'languages'];
 
-	private const array SCANNED_EXTENSIONS = ['php', 'js', 'css'];
+	private const array SCANNED_EXTENSIONS = ['php', 'js', 'ts', 'tsx', 'css'];
 
 	/** @var list<string> Core ProcessWire Wire* classes and third-party debug tool UI label exception. */
 	private const array IGNORED_SIBLING_MODULES = ['TracyDebugger'];
@@ -359,4 +359,71 @@ test('keeps no stale entries in the known-violations allowlist', function (): vo
 	$stale = array_values(array_diff(LayeringScanner::KNOWN_VIOLATIONS, array_keys(LayeringScanner::violations())));
 
 	expect($stale)->toBe([], 'Fixed violations still allowlisted in ' . LayeringScanner::MODULE . " (delete them):\n" . implode("\n", $stale));
+});
+
+test('enforces zero core-API nullsafe chains, zero legacy shims, and composer.json / getModuleInfo() synchronization', function (): void {
+	$root = LayeringScanner::moduleRoot();
+	$files = LayeringScanner::files();
+
+	foreach ($files as $path => $contents) {
+		if (!str_ends_with($path, '.php')) {
+			continue;
+		}
+		expect($contents)->not->toMatch('/->wire\(\)\?->/', "Core API nullsafe chain found in {$path}")
+			->and($contents)->not->toMatch('/\b(class_alias|trait_exists|interface_exists)\s*\(/', "Legacy shim found in {$path}")
+			->and($contents)->not->toContain('@deprecated', "Deprecated tag found in {$path}");
+
+		if ($path !== 'Inertia.module.php' && $path !== 'src/Provider/ProviderRegistry.php') {
+			expect($contents)->not->toMatch('/\brequire_once\b/', "Unexpected require_once in {$path}");
+		}
+	}
+
+	$composerRaw = (string) file_get_contents($root . '/composer.json');
+	/** @var array<string, mixed> $composer */
+	$composer = json_decode($composerRaw, true, 16, JSON_THROW_ON_ERROR);
+	$info = \ProcessWire\Inertia::getModuleInfo();
+
+	expect($composer['description'] ?? null)->toBe($info['summary'] ?? null)
+		->and($composer['homepage'] ?? null)->toBe($info['href'] ?? null)
+		->and($composer['autoload']['files'] ?? [])->toContain('functions.php')
+		->and($composer['require']['php'] ?? null)->toBe('>=8.4')
+		->and($composer['require']['trk/processwire-vite'] ?? null)->not->toBeNull()
+		->and($info['requires'] ?? [])->toContain('PHP>=8.4')
+		->and($info['requires'] ?? [])->toContain('Vite')
+		->and($info['installs'] ?? null)->toBe([])
+		->and($info['permissions'] ?? null)->toBe([]);
+
+	$gitattributes = (string) file_get_contents($root . '/.gitattributes');
+	expect($gitattributes)->not->toContain('/.agents export-ignore');
+
+	$docCandidates = [
+		'README.md',
+		'API.md',
+		'AGENTS.md',
+		'GLOSSARY.md',
+		'.agents/skills/pw-inertia/SKILL.md',
+		'docs/adr/0001-inertia-v3-protocol-and-hybrid-lifecycle.md',
+		'docs/adr/0002-data-provider-architecture.md',
+	];
+	foreach ($docCandidates as $docFile) {
+		$fullDocPath = $root . '/' . $docFile;
+		if (!is_file($fullDocPath)) {
+			continue;
+		}
+		$docText = (string) file_get_contents($fullDocPath);
+		expect($docText)->not->toMatch('/\b(legacy|deprecated|formerly)\b/i', "Banned legacy wording in {$docFile}")
+			->and($docText)->not->toMatch(
+				'/\b(YOOtheme|SEOmatic|Retour|Verbb|Formie|Directus|Sulu|Statamic|Filament|Sanity|Strapi|WordPress|ACF|Laravel|Eloquent|Artisan|Blade|Lucide|Tabler|shadcn|Figma|Iconify)\b/i',
+				"Banned external brand reference in {$docFile}"
+			);
+	}
+
+	$declaredCommands = $composer['extra']['processwire-console']['commands'] ?? [];
+	$discoveredCommands = [];
+	foreach (glob($root . '/commands/*Command.php') ?: [] as $cmdFile) {
+		$discoveredCommands[] = 'Totoglu\\Inertia\\Commands\\' . basename($cmdFile, '.php');
+	}
+	sort($declaredCommands);
+	sort($discoveredCommands);
+	expect($declaredCommands)->toBe($discoveredCommands);
 });
