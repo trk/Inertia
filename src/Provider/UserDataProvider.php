@@ -36,6 +36,19 @@ class UserDataProvider extends Wire
 	];
 
 	/**
+	 * Determine whether `$viewer` is allowed to read private attributes (`email`, `roles`, `isSuperuser`, non-public fields) of `$targetUser`.
+	 */
+	public static function canViewPrivateUserData(User $targetUser, ?User $viewer): bool
+	{
+		return $viewer instanceof User
+			&& (
+				((int) $viewer->id === (int) $targetUser->id)
+				|| $viewer->isSuperuser()
+				|| ($viewer->hasPermission('user-admin') && !$targetUser->isSuperuser())
+			);
+	}
+
+	/**
 	 * @return array<string, mixed>
 	 */
 	public function provide(User $user, ProviderRegistry $registry): array
@@ -44,13 +57,8 @@ class UserDataProvider extends Wire
 			return [];
 		}
 
-		$viewer = $this->wire()?->user;
-		$isSelfOrAdmin = ($viewer instanceof User)
-			&& (
-				((int) $viewer->id === (int) $user->id)
-				|| $viewer->isSuperuser()
-				|| ($viewer->hasPermission('user-admin') && !$user->isSuperuser())
-			);
+		$viewer = $this->wire()->user;
+		$isSelfOrAdmin = self::canViewPrivateUserData($user, $viewer instanceof User ? $viewer : null);
 
 		$roles = [];
 		if ($isSelfOrAdmin) {
@@ -73,7 +81,8 @@ class UserDataProvider extends Wire
 			'isSuperuser' => $isSelfOrAdmin ? $user->isSuperuser() : false,
 		];
 
-		foreach ($this->customFields($user->template) as $name => $field) {
+		$userTemplate = $user->template instanceof Template ? $user->template : null;
+		foreach ($this->customFields($userTemplate) as $name => $field) {
 			if (!$isSelfOrAdmin && (!((bool) $field->useRoles) || !$field->viewable($user))) {
 				continue;
 			}

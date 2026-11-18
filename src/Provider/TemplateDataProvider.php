@@ -6,8 +6,12 @@ namespace Totoglu\Inertia\Provider;
 
 use ProcessWire\Field;
 use ProcessWire\Fieldgroup;
+use ProcessWire\Language;
 use ProcessWire\NullPage;
 use ProcessWire\Page;
+use ProcessWire\Permission;
+use ProcessWire\RepeaterPage;
+use ProcessWire\Role;
 use ProcessWire\Template;
 use ProcessWire\User;
 use ProcessWire\Wire;
@@ -49,7 +53,8 @@ class TemplateDataProvider extends Wire
 	{
 		$data = self::basePageData($page, $registry);
 
-		foreach ($this->eligibleFields($page->template, ['title']) as $name => $field) {
+		$template = $page->template instanceof Template ? $page->template : null;
+		foreach ($this->eligibleFields($template, ['title']) as $name => $field) {
 			if (!self::isFieldViewableOnPage($field, $page)) {
 				continue;
 			}
@@ -136,13 +141,16 @@ class TemplateDataProvider extends Wire
 	public static function basePageData(Page $page, ?ProviderRegistry $registry = null): array
 	{
 		$hasTemplate = $page->template instanceof Template;
+		$hasPublicUrl = $hasTemplate
+			&& !$page instanceof \ProcessWire\RepeaterPage
+			&& !$page instanceof User;
 
 		return [
 			'id' => (int) $page->id,
 			'name' => (string) $page->name,
 			'title' => self::resolveBaseTitle($page, $registry),
-			'url' => $hasTemplate ? (string) $page->url : '',
-			'httpUrl' => $hasTemplate ? (string) $page->httpUrl : '',
+			'url' => $hasPublicUrl ? (string) $page->url : '',
+			'httpUrl' => $hasPublicUrl ? (string) $page->httpUrl : '',
 			'template' => $hasTemplate ? (string) $page->template->name : '',
 			'created' => (int) $page->created,
 			'modified' => (int) $page->modified,
@@ -208,17 +216,38 @@ class TemplateDataProvider extends Wire
 				|| ($page->hasField('process') && (bool) $page->get('process'));
 
 			if ($hasAccessContext) {
+				$wire = $page->wire();
+				$userLang = $wire->languages !== null && $wire->user instanceof User
+					? $wire->user->language
+					: null;
+				$checkLanguage = $userLang instanceof Language
+					&& !$userLang->isDefault()
+					&& (string) $page->template->name !== 'admin'
+					&& !$page instanceof User
+					&& !$page instanceof Role
+					&& !$page instanceof Permission
+					&& !$page instanceof Language
+					&& !$page instanceof RepeaterPage
+					&& !(bool) $page->template->noLang
+					&& $page->get("status{$userLang->id}") !== null
+					? $userLang
+					: false;
+
+				$isViewable = $checkLanguage instanceof Language
+					? $page->viewable($checkLanguage, false)
+					: $page->viewable(false);
+
 				if ($isCurrentAllowed) {
-					if (!$page->viewable(false) && !$page->editable()) {
+					if (!$isViewable && !$page->editable()) {
 						return false;
 					}
-				} elseif (!$page->viewable(false)) {
+				} elseif (!$isViewable) {
 					return false;
 				}
 			}
 		}
 
-		if ($page instanceof \ProcessWire\RepeaterPage) {
+		if ($page instanceof RepeaterPage) {
 			if ($depth > 20 || $page->isHidden()) {
 				return false;
 			}

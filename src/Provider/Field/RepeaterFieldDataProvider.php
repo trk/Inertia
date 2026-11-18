@@ -47,16 +47,24 @@ final class RepeaterFieldDataProvider extends FieldDataProvider
 
 	public function transform(mixed $value, ?Field $field = null, ?Page $page = null): mixed
 	{
-		if ($value instanceof Page && !$value instanceof NullPage) {
-			return self::isAccessibleRepeaterItem($value) ? $this->serializeRepeaterItem($value) : null;
+		if ($value instanceof NullPage) {
+			return ($field === null || $this->isFieldsetPage($field)) ? null : [];
+		}
+
+		$effectiveContext = $this->registry()?->activeContextPage() ?? $page;
+
+		if ($value instanceof Page) {
+			return self::isAccessibleRepeaterItem($value, $effectiveContext)
+				? $this->serializeRepeaterItem($value, $effectiveContext)
+				: null;
 		}
 
 		$maxItems = $field !== null ? (int) $field->get('repeaterMaxItems') : 0;
 		$items = [];
 		if ($value instanceof PageArray || is_iterable($value)) {
 			foreach ($value as $item) {
-				if ($item instanceof Page && self::isAccessibleRepeaterItem($item)) {
-					$serialized = $this->serializeRepeaterItem($item);
+				if ($item instanceof Page && self::isAccessibleRepeaterItem($item, $effectiveContext)) {
+					$serialized = $this->serializeRepeaterItem($item, $effectiveContext);
 					if ($serialized !== null) {
 						$items[] = $serialized;
 						if ($maxItems > 0 && count($items) >= $maxItems) {
@@ -70,9 +78,9 @@ final class RepeaterFieldDataProvider extends FieldDataProvider
 		return $items;
 	}
 
-	private static function isAccessibleRepeaterItem(Page $item): bool
+	private static function isAccessibleRepeaterItem(Page $item, ?Page $contextPage = null): bool
 	{
-		$currentPage = $item->wire()?->page;
+		$currentPage = $contextPage ?? $item->wire()->page;
 
 		return !$item->isHidden()
 			&& TemplateDataProvider::isAccessiblePage($item, true, $currentPage instanceof Page ? $currentPage : null);
@@ -143,7 +151,7 @@ final class RepeaterFieldDataProvider extends FieldDataProvider
 	/**
 	 * @return array<string, mixed>|null
 	 */
-	private function serializeRepeaterItem(Page $item): ?array
+	private function serializeRepeaterItem(Page $item, ?Page $contextPage = null): ?array
 	{
 		if ((int) $item->id <= 0) {
 			return null;
@@ -151,11 +159,15 @@ final class RepeaterFieldDataProvider extends FieldDataProvider
 
 		$registry = $this->registry();
 		$data = $registry instanceof ProviderRegistry
-			? $registry->providePage($item)
+			? $registry->providePage($item, $contextPage)
 			: TemplateDataProvider::basePageData($item);
+		if ($data === []) {
+			return null;
+		}
 
 		$matrixType = $item->get('repeater_matrix_type');
 		if ($matrixType !== null && $matrixType !== '') {
+			unset($data['repeater_matrix_type']);
 			$data['matrixType'] = is_numeric($matrixType) ? (int) $matrixType : (string) $matrixType;
 		}
 

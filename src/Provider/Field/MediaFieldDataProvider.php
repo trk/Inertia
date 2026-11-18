@@ -35,10 +35,11 @@ final class MediaFieldDataProvider extends FieldDataProvider
 	{
 		$isImage = $field !== null ? $this->isImageField($field) : $value instanceof Pageimage;
 		$isSingle = $this->isSingleMedia($field);
+		$effectiveContext = $this->registry()?->activeContextPage() ?? $page;
 
 		return $isImage
-			? self::serializeImageValue($value, $isSingle)
-			: self::serializeFileValue($value, $isSingle);
+			? self::serializeImageValue($value, $isSingle, null, $effectiveContext)
+			: self::serializeFileValue($value, $isSingle, $effectiveContext);
 	}
 
 	public function phpType(Field $field): string
@@ -121,26 +122,32 @@ TS,
 	 * @param callable(Pageimage): array<string, mixed>|null $formatter
 	 * @return array<string, mixed>|list<array<string, mixed>>|null
 	 */
-	public static function serializeImageValue(mixed $value, bool $single = true, ?callable $formatter = null): ?array
-	{
+	public static function serializeImageValue(
+		mixed $value,
+		bool $single = true,
+		?callable $formatter = null,
+		?Page $contextPage = null
+	): ?array {
 		return self::serializeMediaValue(
 			$value,
 			$single,
 			Pageimage::class,
-			$formatter ?? static fn(Pageimage $item): array => self::formatPageimage($item)
+			$formatter ?? static fn(Pageimage $item): array => self::formatPageimage($item),
+			$contextPage
 		);
 	}
 
 	/**
 	 * @return array<string, mixed>|list<array<string, mixed>>|null
 	 */
-	public static function serializeFileValue(mixed $value, bool $single = true): ?array
+	public static function serializeFileValue(mixed $value, bool $single = true, ?Page $contextPage = null): ?array
 	{
 		return self::serializeMediaValue(
 			$value,
 			$single,
 			Pagefile::class,
-			static fn(Pagefile $item): array => self::formatPagefile($item)
+			static fn(Pagefile $item): array => self::formatPagefile($item),
+			$contextPage
 		);
 	}
 
@@ -150,13 +157,18 @@ TS,
 	 * @param callable(T): array<string, mixed> $formatter
 	 * @return array<string, mixed>|list<array<string, mixed>>|null
 	 */
-	private static function serializeMediaValue(mixed $value, bool $single, string $expectedClass, callable $formatter): ?array
-	{
+	private static function serializeMediaValue(
+		mixed $value,
+		bool $single,
+		string $expectedClass,
+		callable $formatter,
+		?Page $contextPage = null
+	): ?array {
 		$candidates = $value instanceof $expectedClass ? [$value] : (is_iterable($value) ? $value : []);
 		$items = [];
 
 		foreach ($candidates as $item) {
-			if ($item instanceof $expectedClass && self::isAccessiblePagefile($item)) {
+			if ($item instanceof $expectedClass && self::isAccessiblePagefile($item, $contextPage)) {
 				$formatted = $formatter($item);
 				if ($single) {
 					return $formatted;
@@ -168,9 +180,9 @@ TS,
 		return $single ? null : $items;
 	}
 
-	public static function isAccessiblePagefile(Pagefile $file): bool
+	public static function isAccessiblePagefile(Pagefile $file, ?Page $contextPage = null): bool
 	{
-		if ($file->isTemp() || $file->hidden()) {
+		if ((int) $file->created === Pagefile::createdTemp || $file->hidden()) {
 			return false;
 		}
 
@@ -184,14 +196,8 @@ TS,
 				if ($ownerPage->isTrash() || $ownerPage->isUnpublished()) {
 					return false;
 				}
-				$viewer = $file->wire()?->user;
-				$isSelfOrAdmin = ($viewer instanceof User)
-					&& (
-						((int) $viewer->id === (int) $ownerPage->id)
-						|| $viewer->isSuperuser()
-						|| ($viewer->hasPermission('user-admin') && !$ownerPage->isSuperuser())
-					);
-				if ($isSelfOrAdmin) {
+				$viewer = $file->wire()->user;
+				if (\Totoglu\Inertia\Provider\UserDataProvider::canViewPrivateUserData($ownerPage, $viewer instanceof User ? $viewer : null)) {
 					return true;
 				}
 
@@ -200,9 +206,16 @@ TS,
 					&& $file->field->viewable($ownerPage);
 			}
 
-			$currentPage = $file->wire()?->page;
-			$isCurrentAllowed = $currentPage instanceof Page && $currentPage->id > 0 && $currentPage->id === $ownerPage->id;
-			if (!TemplateDataProvider::isAccessiblePage($ownerPage, true, $currentPage instanceof Page ? $currentPage : null)) {
+			$currentPage = $contextPage ?? $file->wire()->page;
+			$effectiveCurrentPage = $currentPage instanceof Page ? $currentPage : null;
+			$isCurrentAllowed = $effectiveCurrentPage !== null && $effectiveCurrentPage->id > 0 && (
+				$effectiveCurrentPage->id === $ownerPage->id
+				|| ($ownerPage instanceof \ProcessWire\RepeaterPage && (
+					(int) $ownerPage->getForPage()->id === (int) $effectiveCurrentPage->id
+					|| (int) $ownerPage->getForPageRoot()->id === (int) $effectiveCurrentPage->id
+				))
+			);
+			if (!TemplateDataProvider::isAccessiblePage($ownerPage, true, $effectiveCurrentPage)) {
 				return false;
 			}
 
@@ -212,7 +225,11 @@ TS,
 				|| (bool) $ownerPage->template->useRoles
 				|| ($ownerPage->hasField('process') && (bool) $ownerPage->get('process'))
 			);
-			if ($hasAccessContext && !$ownerPage->viewable($file) && !($isCurrentAllowed && $ownerPage->editable())) {
+			$canEditCurrentContext = $isCurrentAllowed && (
+				$ownerPage->editable()
+				|| ($effectiveCurrentPage !== null && $effectiveCurrentPage->editable())
+			);
+			if ($hasAccessContext && !$ownerPage->viewable($file) && !$canEditCurrentContext) {
 				return false;
 			}
 		}

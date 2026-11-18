@@ -33,11 +33,13 @@ final class ProviderRegistry extends Wire
 	/** @var array<string, TemplateDataProvider> */
 	private array $templateProviders = [];
 
-	private UserDataProvider $userProvider;
+	private ?UserDataProvider $userProvider = null;
 
-	private FieldDataProvider $fallbackFieldProvider;
+	private ?FieldDataProvider $fallbackFieldProvider = null;
 
-	private TemplateDataProvider $fallbackTemplateProvider;
+	private ?TemplateDataProvider $fallbackTemplateProvider = null;
+
+	private bool $defaultsInitialized = false;
 
 	/**
 	 * Track active Page IDs during `providePage()` serialization to prevent infinite recursion on circular Page graphs.
@@ -46,18 +48,20 @@ final class ProviderRegistry extends Wire
 	 */
 	private array $activePageIds = [];
 
-	public function __construct()
-	{
-		parent::__construct();
-		$this->resetToDefaults();
-	}
+	private ?Page $activeContextPage = null;
 
 	public function wired(): void
 	{
 		parent::wired();
-		$this->wire($this->fallbackFieldProvider);
-		$this->wire($this->fallbackTemplateProvider);
-		$this->wire($this->userProvider);
+		if ($this->fallbackFieldProvider !== null) {
+			$this->wire($this->fallbackFieldProvider);
+		}
+		if ($this->fallbackTemplateProvider !== null) {
+			$this->wire($this->fallbackTemplateProvider);
+		}
+		if ($this->userProvider !== null) {
+			$this->wire($this->userProvider);
+		}
 
 		foreach ($this->fieldProviders as $provider) {
 			$this->wire($provider);
@@ -68,11 +72,19 @@ final class ProviderRegistry extends Wire
 		}
 	}
 
+	private function ensureDefaults(): void
+	{
+		if (!$this->defaultsInitialized) {
+			$this->resetToDefaults();
+		}
+	}
+
 	/**
 	 * Reset registry to built-in core providers.
 	 */
 	public function resetToDefaults(): self
 	{
+		$this->defaultsInitialized = true;
 		$this->fieldProviders = [];
 		$this->templateProviders = [];
 
@@ -98,6 +110,7 @@ final class ProviderRegistry extends Wire
 	public function register(
 		FieldDataProvider|TemplateDataProvider|UserDataProvider $provider
 	): self {
+		$this->ensureDefaults();
 		$this->wire($provider);
 
 		if ($provider instanceof FieldDataProvider) {
@@ -152,6 +165,7 @@ final class ProviderRegistry extends Wire
 	 */
 	public function resolveFieldProvider(Field $field): FieldDataProvider
 	{
+		$this->ensureDefaults();
 		$fieldName = trim((string) $field->name);
 		if ($fieldName !== '' && isset($this->fieldProviders['field:' . $fieldName])) {
 			return $this->fieldProviders['field:' . $fieldName];
@@ -169,22 +183,22 @@ final class ProviderRegistry extends Wire
 				return $this->fieldProviders[$fqcn];
 			}
 
-			if ($typeObj instanceof InertiaFieldtypeInterface || method_exists($typeObj, 'toInertiaFieldValue')) {
+			if ($typeObj instanceof InertiaFieldtypeInterface) {
 				return $this->createFieldtypeBridgeProvider($typeObj, $shortClass);
 			}
 		}
 
-		return $this->fieldProviders['*'] ?? $this->fallbackFieldProvider;
+		return $this->fieldProviders['*'] ?? ($this->fallbackFieldProvider ??= new ScalarFieldDataProvider());
 	}
 
 	/**
-	 * Wrap an `InertiaFieldtypeInterface` (or duck-typed `Fieldtype`) inside a `FieldDataProvider` adapter.
+	 * Wrap an `InertiaFieldtypeInterface` implementation inside a `FieldDataProvider` adapter.
 	 */
-	private function createFieldtypeBridgeProvider(object $fieldtype, string $shortClass): FieldDataProvider
+	private function createFieldtypeBridgeProvider(InertiaFieldtypeInterface $fieldtype, string $shortClass): FieldDataProvider
 	{
 		$provider = new class($fieldtype, $shortClass) extends FieldDataProvider {
 			public function __construct(
-				private readonly object $fieldtype,
+				private readonly InertiaFieldtypeInterface $fieldtype,
 				private readonly string $shortClass
 			) {
 				parent::__construct();
@@ -197,7 +211,7 @@ final class ProviderRegistry extends Wire
 
 			public function transform(mixed $value, ?Field $field = null, ?Page $page = null): mixed
 			{
-				if ($field instanceof Field && method_exists($this->fieldtype, 'toInertiaFieldValue')) {
+				if ($field instanceof Field) {
 					return $this->fieldtype->toInertiaFieldValue($value, $field, $page);
 				}
 
@@ -206,31 +220,17 @@ final class ProviderRegistry extends Wire
 
 			public function phpType(Field $field): string
 			{
-				if (method_exists($this->fieldtype, 'toInertiaPhpType')) {
-					return (string) $this->fieldtype->toInertiaPhpType($field);
-				}
-
-				return 'mixed';
+				return $this->fieldtype->toInertiaPhpType($field);
 			}
 
 			public function tsType(Field $field): string
 			{
-				if (method_exists($this->fieldtype, 'toInertiaTsType')) {
-					return (string) $this->fieldtype->toInertiaTsType($field);
-				}
-
-				return 'unknown';
+				return $this->fieldtype->toInertiaTsType($field);
 			}
 
 			public function tsDefinitions(?Field $field = null): array
 			{
-				if (method_exists($this->fieldtype, 'toInertiaTsDefinitions')) {
-					$defs = $this->fieldtype->toInertiaTsDefinitions($field);
-
-					return is_array($defs) ? $defs : [];
-				}
-
-				return [];
+				return $this->fieldtype->toInertiaTsDefinitions($field);
 			}
 		};
 
@@ -261,6 +261,7 @@ final class ProviderRegistry extends Wire
 	 */
 	public function resolveObjectProvider(object $value): ?FieldDataProvider
 	{
+		$this->ensureDefaults();
 		$fqcn = $value::class;
 		if (isset($this->fieldProviders[$fqcn])) {
 			return $this->fieldProviders[$fqcn];
@@ -283,12 +284,27 @@ final class ProviderRegistry extends Wire
 	 */
 	public function resolveTemplateProvider(Template|string|null $template): TemplateDataProvider
 	{
+		$this->ensureDefaults();
 		$name = $template instanceof Template ? trim((string) $template->name) : trim((string) $template);
 		if ($name !== '' && isset($this->templateProviders[$name])) {
 			return $this->templateProviders[$name];
 		}
 
-		return $this->templateProviders['*'] ?? $this->fallbackTemplateProvider;
+		return $this->templateProviders['*'] ?? ($this->fallbackTemplateProvider ??= new TemplateDataProvider());
+	}
+
+	/**
+	 * Return the active root `Page` context during `providePage()` serialization, or fall back to `$this->wire()->page`.
+	 */
+	public function activeContextPage(): ?Page
+	{
+		if ($this->activeContextPage !== null) {
+			return $this->activeContextPage;
+		}
+
+		$wirePage = $this->wire()->page;
+
+		return $wirePage instanceof Page ? $wirePage : null;
 	}
 
 	/**
@@ -297,14 +313,15 @@ final class ProviderRegistry extends Wire
 	 *
 	 * @return array<string, mixed>
 	 */
-	public function providePage(Page $page): array
+	public function providePage(Page $page, ?Page $contextPage = null): array
 	{
 		if ($page instanceof User) {
 			return $this->provideUser($page);
 		}
 
-		$currentPage = $this->wire()?->page;
-		if (!TemplateDataProvider::isAccessiblePage($page, true, $currentPage instanceof Page ? $currentPage : null)) {
+		$currentPage = $contextPage ?? $this->activeContextPage();
+		$effectiveContext = $currentPage instanceof Page ? $currentPage : null;
+		if (!TemplateDataProvider::isAccessiblePage($page, true, $effectiveContext)) {
 			return [];
 		}
 
@@ -317,11 +334,15 @@ final class ProviderRegistry extends Wire
 			$this->activePageIds[$id] = true;
 		}
 
+		$previousContext = $this->activeContextPage;
+		$this->activeContextPage = $effectiveContext;
+
 		try {
 			$provider = $this->resolveTemplateProvider($page->template);
 
 			return $provider->provide($page, $this);
 		} finally {
+			$this->activeContextPage = $previousContext;
 			if ($id > 0) {
 				unset($this->activePageIds[$id]);
 			}
@@ -335,34 +356,37 @@ final class ProviderRegistry extends Wire
 	 */
 	public function provideUser(User $user): array
 	{
-		return $this->userProvider->provide($user, $this);
+		return $this->getUserProvider()->provide($user, $this);
 	}
 
 	/**
 	 * Transform a standalone ProcessWire `Pageimage` via the active `FieldtypeImage` provider.
 	 */
-	public function provideImage(Pageimage $image): mixed
+	public function provideImage(Pageimage $image, ?Page $contextPage = null): mixed
 	{
-		return $this->provideMedia($image, 'FieldtypeImage');
+		return $this->provideMedia($image, 'FieldtypeImage', $contextPage);
 	}
 
 	/**
 	 * Transform a standalone ProcessWire `Pagefile` via the active `FieldtypeFile` provider.
 	 */
-	public function provideFile(Pagefile $file): mixed
+	public function provideFile(Pagefile $file, ?Page $contextPage = null): mixed
 	{
-		return $this->provideMedia($file, 'FieldtypeFile');
+		return $this->provideMedia($file, 'FieldtypeFile', $contextPage);
 	}
 
-	private function provideMedia(Pagefile $file, string $fieldtypeClass): mixed
+	private function provideMedia(Pagefile $file, string $fieldtypeClass, ?Page $contextPage = null): mixed
 	{
-		if (!MediaFieldDataProvider::isAccessiblePagefile($file)) {
+		$this->ensureDefaults();
+		$effectiveContext = $contextPage ?? $this->activeContextPage();
+		if (!MediaFieldDataProvider::isAccessiblePagefile($file, $effectiveContext)) {
 			return null;
 		}
 
-		$provider = $this->fieldProviders[$fieldtypeClass] ?? $this->fallbackFieldProvider;
+		$provider = $this->fieldProviders[$fieldtypeClass] ?? ($this->fallbackFieldProvider ??= new ScalarFieldDataProvider());
+		$targetPage = $effectiveContext ?? ($file->page instanceof Page ? $file->page : null);
 
-		return $provider->transform($file, null, $file->page instanceof Page ? $file->page : null);
+		return $provider->transform($file, null, $targetPage);
 	}
 
 	/**
@@ -373,6 +397,7 @@ final class ProviderRegistry extends Wire
 	 */
 	public function mediaTsDefinitions(): array
 	{
+		$this->ensureDefaults();
 		$defaults = MediaFieldDataProvider::defaultTsDefinitions();
 		$targets = [
 			'FieldtypeImage' => 'InertiaImage',
@@ -401,6 +426,7 @@ final class ProviderRegistry extends Wire
 	 */
 	public function globalTsDefinitions(): array
 	{
+		$this->ensureDefaults();
 		$definitions = [];
 		$seen = [];
 		$mediaKeys = $this->mediaTsDefinitions();
@@ -425,6 +451,14 @@ final class ProviderRegistry extends Wire
 
 	public function getUserProvider(): UserDataProvider
 	{
+		$this->ensureDefaults();
+
+		if ($this->userProvider === null) {
+			$userProvider = new UserDataProvider();
+			$this->wire($userProvider);
+			$this->userProvider = $userProvider;
+		}
+
 		return $this->userProvider;
 	}
 
@@ -433,8 +467,9 @@ final class ProviderRegistry extends Wire
 	 */
 	public function discoverFromDirectory(string $directory): self
 	{
+		$this->ensureDefaults();
 		$cleanDir = rtrim($directory, '/\\');
-		if ($cleanDir === '' || !is_dir($cleanDir)) {
+		if ($cleanDir === '' || is_link($cleanDir) || !is_dir($cleanDir)) {
 			return $this;
 		}
 
@@ -447,40 +482,48 @@ final class ProviderRegistry extends Wire
 		sort($files);
 
 		foreach ($files as $file) {
-			$realFile = is_file($file) && is_readable($file) ? realpath($file) : false;
+			if (is_link($file) || !is_file($file) || !is_readable($file)) {
+				continue;
+			}
+
+			$realFile = realpath($file);
 			if (!is_string($realFile) || !str_starts_with($realFile, $realDir . DIRECTORY_SEPARATOR)) {
 				continue;
 			}
 
-			$className = $this->resolveClassFromFile($realFile);
-			if ($className === null) {
-				continue;
-			}
+			foreach ($this->resolveClassesFromFile($realFile) as $className) {
+				if (preg_match('/^[A-Za-z_][A-Za-z0-9_\\\\]*$/', $className) !== 1) {
+					continue;
+				}
 
-			if (!class_exists($className, false)) {
-				require_once $realFile;
-			}
+				if (!class_exists($className, false)) {
+					require_once $realFile;
+				}
 
-			if (!class_exists($className)) {
-				continue;
-			}
+				if (!class_exists($className, false)) {
+					continue;
+				}
 
-			$ref = new ReflectionClass($className);
-			if ($ref->isAbstract()) {
-				continue;
-			}
+				$ref = new ReflectionClass($className);
+				if (
+					!$ref->isInstantiable()
+					|| $ref->getFileName() !== $realFile
+					|| (
+						!$ref->isSubclassOf(FieldDataProvider::class)
+						&& !$ref->isSubclassOf(TemplateDataProvider::class)
+						&& !$ref->isSubclassOf(UserDataProvider::class)
+					)
+				) {
+					continue;
+				}
 
-			$ctor = $ref->getConstructor();
-			if ($ctor !== null && $ctor->getNumberOfRequiredParameters() > 0) {
-				continue;
-			}
+				$ctor = $ref->getConstructor();
+				if ($ctor !== null && $ctor->getNumberOfRequiredParameters() > 0) {
+					continue;
+				}
 
-			$instance = $ref->newInstance();
-			if (
-				$instance instanceof FieldDataProvider
-				|| $instance instanceof TemplateDataProvider
-				|| $instance instanceof UserDataProvider
-			) {
+				/** @var FieldDataProvider|TemplateDataProvider|UserDataProvider $instance */
+				$instance = $ref->newInstance();
 				$this->register($instance);
 			}
 		}
@@ -562,26 +605,85 @@ TS,
 	}
 
 	/**
-	 * Extract the fully-qualified class name from a PHP source file.
+	 * Extract all fully-qualified concrete class names from a PHP source file using PHP's native lexer.
+	 *
+	 * @return list<string>
 	 */
-	private function resolveClassFromFile(string $filePath): ?string
+	private function resolveClassesFromFile(string $filePath): array
 	{
 		$source = (string) file_get_contents($filePath);
 		if ($source === '') {
-			return null;
+			return [];
 		}
 
+		$tokens = \PhpToken::tokenize($source);
+		$count = count($tokens);
 		$namespace = '';
-		if (preg_match('/^\s*namespace\s+([a-zA-Z0-9_\\\\]+)\s*;/m', $source, $nsMatch) === 1) {
-			$namespace = trim($nsMatch[1]);
+		$classes = [];
+
+		for ($i = 0; $i < $count; $i++) {
+			$token = $tokens[$i];
+
+			if ($token->id === T_NAMESPACE) {
+				$firstMeaningful = null;
+				for ($k = $i + 1; $k < $count; $k++) {
+					if (!$tokens[$k]->isIgnorable()) {
+						$firstMeaningful = $tokens[$k];
+						break;
+					}
+				}
+				if ($firstMeaningful !== null && $firstMeaningful->id === T_NS_SEPARATOR) {
+					continue;
+				}
+
+				$nsParts = [];
+				for ($j = $i + 1; $j < $count; $j++) {
+					$next = $tokens[$j];
+					if ($next->isIgnorable()) {
+						continue;
+					}
+					if ($next->id === T_NAME_QUALIFIED || $next->id === T_STRING || $next->id === T_NS_SEPARATOR) {
+						$nsParts[] = $next->text;
+					} else {
+						break;
+					}
+				}
+				$namespace = trim(implode('', $nsParts), '\\');
+				continue;
+			}
+
+			if ($token->id === T_CLASS) {
+				$skipClass = false;
+				for ($p = $i - 1; $p >= 0; $p--) {
+					if ($tokens[$p]->isIgnorable()) {
+						continue;
+					}
+					$prevId = $tokens[$p]->id;
+					if ($prevId === T_READONLY || $prevId === T_FINAL) {
+						continue;
+					}
+					if ($prevId === T_ABSTRACT || $prevId === T_DOUBLE_COLON || $prevId === T_NEW) {
+						$skipClass = true;
+					}
+					break;
+				}
+				if ($skipClass) {
+					continue;
+				}
+
+				for ($j = $i + 1; $j < $count; $j++) {
+					if ($tokens[$j]->isIgnorable()) {
+						continue;
+					}
+					if ($tokens[$j]->id === T_STRING) {
+						$className = $tokens[$j]->text;
+						$classes[] = $namespace !== '' ? $namespace . '\\' . $className : $className;
+					}
+					break;
+				}
+			}
 		}
 
-		if (preg_match('/^\s*(?:final\s+|readonly\s+)*class\s+([a-zA-Z0-9_]+)/m', $source, $clsMatch) !== 1) {
-			return null;
-		}
-
-		$className = trim($clsMatch[1]);
-
-		return $namespace !== '' ? $namespace . '\\' . $className : $className;
+		return $classes;
 	}
 }

@@ -39,9 +39,12 @@ final class PageReferenceFieldDataProvider extends FieldDataProvider
 		$candidates = $value instanceof Page ? [$value] : (is_iterable($value) ? $value : []);
 		$items = [];
 
+		$currentPage = $this->registry()?->activeContextPage() ?? $this->wire()->page;
+		$allowedCurrent = $currentPage instanceof Page ? $currentPage : null;
+
 		foreach ($candidates as $item) {
-			if ($item instanceof Page && TemplateDataProvider::isAccessiblePage($item)) {
-				$data = TemplateDataProvider::basePageData($item);
+			if ($item instanceof Page && TemplateDataProvider::isAccessiblePage($item, true, $allowedCurrent)) {
+				$data = TemplateDataProvider::basePageData($item, $this->registry());
 				if ($isSingle) {
 					return $data;
 				}
@@ -54,7 +57,12 @@ final class PageReferenceFieldDataProvider extends FieldDataProvider
 
 	public function phpType(Field $field): string
 	{
-		return $this->isSingleReference($field) ? 'Page|NullPage' : 'PageArray';
+		$deref = (int) $field->get('derefAsPage');
+		if ($deref === 1) {
+			return 'Page|false';
+		}
+
+		return $deref > 0 ? 'Page|NullPage' : 'PageArray';
 	}
 
 	public function tsType(Field $field): string
