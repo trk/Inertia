@@ -28,10 +28,21 @@ trait InteractWithInertia
 	 */
 	public function inertia(): Inertia
 	{
-		/** @var object $host */
-		$host = $this;
+		return Inertia::instance(self::asWireHost($this));
+	}
 
-		return Inertia::instance($host instanceof Wire ? $host : null);
+	private static function asWireHost(object $host): ?Wire
+	{
+		return $host instanceof Wire ? $host : null;
+	}
+
+	private static function bindHostContext(PageResponse $response, object $host): void
+	{
+		if ($host instanceof Page) {
+			$response->forPage($host);
+		} elseif ($host instanceof Process) {
+			$response->forProcess($host);
+		}
 	}
 
 	/**
@@ -71,14 +82,7 @@ trait InteractWithInertia
 			? array_replace($this->inertiaProps, $props)
 			: $props;
 		$response = $this->inertia()->render($component, $mergedProps);
-
-		/** @var object $host */
-		$host = $this;
-		if ($host instanceof Page) {
-			$response->forPage($host);
-		} elseif ($host instanceof Process) {
-			$response->forProcess($host);
-		}
+		self::bindHostContext($response, $this);
 
 		return $response;
 	}
@@ -151,11 +155,12 @@ trait InteractWithInertia
 	 */
 	protected function enqueueInertiaIslandAssets(): bool
 	{
-		/** @var object $host */
-		$host = $this;
-		if (!$host instanceof Wire) {
+		$host = self::asWireHost($this);
+		if ($host === null) {
 			return false;
 		}
+
+		$this->inertia()->ensureXsrfCookie();
 
 		$config = $host->wire()->config;
 
@@ -166,7 +171,7 @@ trait InteractWithInertia
 
 		$enqueuedAny = false;
 		$styles = is_array($viewData['styles'] ?? null) ? $viewData['styles'] : [];
-		if ($config->styles) {
+		if ($config->styles !== null) {
 			foreach ($styles as $styleUrl) {
 				if (is_string($styleUrl) && $this->isSafeAssetUrl($styleUrl)) {
 					$config->styles->add(trim($styleUrl));
@@ -176,7 +181,7 @@ trait InteractWithInertia
 		}
 
 		$scripts = is_array($viewData['scripts'] ?? null) ? $viewData['scripts'] : [];
-		if ($config->scripts) {
+		if ($config->scripts !== null) {
 			foreach ($scripts as $scriptUrl) {
 				if (is_string($scriptUrl) && $this->isSafeAssetUrl($scriptUrl)) {
 					$config->scripts->add(trim($scriptUrl));
@@ -185,9 +190,11 @@ trait InteractWithInertia
 			}
 		}
 
-		$shared = $this->inertiaShared();
+		$shared = Inertia::withoutEntityEncoding(fn(): array => $this->inertiaShared());
 		if ($shared !== []) {
-			$resolvedShared = $this->inertia()->resolver->resolveValue($shared);
+			$resolvedShared = Inertia::withoutEntityEncoding(
+				fn(): mixed => $this->inertia()->resolver->resolveValue($shared)
+			);
 			$existingShared = $config->js('InertiaShared');
 			$mergedShared = is_array($existingShared) && is_array($resolvedShared)
 				? array_replace($existingShared, $resolvedShared)
@@ -227,31 +234,19 @@ trait InteractWithInertia
 				return false;
 			}
 
-			/** @var object $hostObj */
-			$hostObj = $this;
-			$config = $hostObj instanceof Wire ? $hostObj->wire()?->config : null;
-			if ($config !== null) {
-				if ((bool) $config->https && strtolower((string) ($parts['scheme'] ?? '')) !== 'https') {
-					return false;
-				}
-				$candidateHost = strtolower((string) $parts['host']);
-				$candidateAuthority = isset($parts['port']) ? $candidateHost . ':' . (int) $parts['port'] : $candidateHost;
-				$allowedHosts = [];
-				$currentHost = strtolower(trim((string) $config->httpHost));
-				if ($currentHost !== '') {
-					$allowedHosts[] = $currentHost;
-				}
-				if (is_array($config->httpHosts)) {
-					foreach ($config->httpHosts as $whitelisted) {
-						$norm = strtolower(trim((string) $whitelisted));
-						if ($norm !== '') {
-							$allowedHosts[] = $norm;
-						}
-					}
-				}
-				if ($allowedHosts !== [] && !in_array($candidateAuthority, $allowedHosts, true) && !in_array($candidateHost, $allowedHosts, true)) {
-					return false;
-				}
+			$wireHost = self::asWireHost($this);
+			if ($wireHost === null) {
+				return false;
+			}
+
+			$config = $wireHost->wire()->config;
+			if ((bool) $config->https && strtolower((string) ($parts['scheme'] ?? '')) !== 'https') {
+				return false;
+			}
+			$candidateHost = strtolower((string) $parts['host']);
+			$candidatePort = isset($parts['port']) ? (int) $parts['port'] : null;
+			if (!Inertia::isTrustedAuthority($config, $candidateHost, $candidatePort)) {
+				return false;
 			}
 		}
 
@@ -263,12 +258,12 @@ trait InteractWithInertia
 	 */
 	protected function encodeHtmlAttribute(string $value): string
 	{
-		/** @var object $host */
-		$host = $this;
-		if ($host instanceof Wire) {
-			return $host->wire()->sanitizer->entities($value);
+		$clean = str_replace("\0", '', $value);
+		$host = self::asWireHost($this);
+		if ($host !== null) {
+			return $host->wire()->sanitizer->entities($clean);
 		}
 
-		return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+		return htmlspecialchars($clean, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 	}
 }

@@ -6,6 +6,7 @@ namespace Totoglu\Inertia\Props;
 
 use Closure;
 use Totoglu\Inertia\Request;
+use Totoglu\Inertia\Support\PropResolver;
 
 /**
  * Prop wrapper evaluated and included on every response, even during partial reloads
@@ -20,6 +21,6 @@ final class AlwaysProp implements PropInterface
 
 	public function __invoke(?Request $request = null): mixed
 	{
-		return $this->value instanceof Closure ? ($this->value)() : $this->value;
+		return $this->value instanceof Closure ? PropResolver::invokeCallback($this->value, $request) : $this->value;
 	}
 }

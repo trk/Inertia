@@ -8,6 +8,7 @@ use ProcessWire\Inertia;
 use ProcessWire\Inputfield;
 use ProcessWire\InputfieldWrapper;
 use ProcessWire\Wire;
+use Totoglu\Inertia\Request;
 use Throwable;
 
 /**
@@ -20,26 +21,6 @@ final class ErrorBag extends Wire
 	public const string SESSION_KEY = 'errors';
 
 	private const int MAX_NORMALIZE_DEPTH = 16;
-
-	/**
-	 * Reserved superglobal and prototype-pollution identifiers rejected as error bag or field keys.
-	 *
-	 * @var list<string>
-	 */
-	private const array BLOCKED_BAG_KEYS = [
-		'__proto__',
-		'constructor',
-		'prototype',
-		'GLOBALS',
-		'_GET',
-		'_POST',
-		'_COOKIE',
-		'_REQUEST',
-		'_SERVER',
-		'_ENV',
-		'_FILES',
-		'_SESSION',
-	];
 
 	/** @var array<string, mixed> In-memory errors queued during current request */
 	private array $runtimeErrors = [];
@@ -80,6 +61,8 @@ final class ErrorBag extends Wire
 	 * If `$headerErrorBag` (`X-Inertia-Error-Bag`) is provided and errors are flat,
 	 * wraps them under `$headerErrorBag`. Always returns an associative array or
 	 * `stdClass` (when empty) so JSON serialization produces `{}` instead of `[]`.
+	 *
+	 * @return object|array<string, mixed>
 	 */
 	public function resolve(?string $headerErrorBag = null): object|array
 	{
@@ -168,7 +151,8 @@ final class ErrorBag extends Wire
 
 			$fieldErrors = $inputfield->getErrors(true);
 			if (is_array($fieldErrors) && $fieldErrors !== []) {
-				$attrName = (string) $inputfield->attr('name');
+				$rawAttrName = $inputfield->attr('name');
+				$attrName = is_scalar($rawAttrName) ? (string) $rawAttrName : '';
 				$name = $attrName !== '' ? $attrName : (string) $inputfield->name;
 				if ($name !== '') {
 					$result[$name] = (string) reset($fieldErrors);
@@ -202,7 +186,7 @@ final class ErrorBag extends Wire
 		if (
 			$trimmed === ''
 			|| preg_match('/^[a-zA-Z0-9_.-]{1,64}$/', $trimmed) !== 1
-			|| in_array($trimmed, self::BLOCKED_BAG_KEYS, true)
+			|| !Request::isSafeInputKey($trimmed)
 		) {
 			return null;
 		}
@@ -226,13 +210,7 @@ final class ErrorBag extends Wire
 		$normalized = [];
 
 		foreach ($errors as $key => $value) {
-			if (
-				!is_string($key)
-				|| $key === ''
-				|| strlen($key) > 128
-				|| preg_match('/[\x00-\x20\x7F]/', $key) === 1
-				|| in_array($key, self::BLOCKED_BAG_KEYS, true)
-			) {
+			if (!is_string($key) || !Request::isSafeInputKey($key)) {
 				continue;
 			}
 

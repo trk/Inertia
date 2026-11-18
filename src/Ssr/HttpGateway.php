@@ -86,8 +86,8 @@ class HttpGateway extends Wire implements SsrGatewayInterface
 			return null;
 		}
 
-		$json = json_encode($pageObject, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
-		if (!is_string($json) || $json === '') {
+		$json = json_encode($pageObject, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR);
+		if (!is_string($json)) {
 			return null;
 		}
 
@@ -363,7 +363,7 @@ class HttpGateway extends Wire implements SsrGatewayInterface
 	 */
 	private function configuredAllowedHosts(): array
 	{
-		$rawAllowed = $this->wire()?->config?->inertiaSsrAllowedHosts ?? null;
+		$rawAllowed = $this->wire()->config->get('inertiaSsrAllowedHosts');
 		if (!is_array($rawAllowed)) {
 			return [];
 		}
@@ -408,7 +408,7 @@ class HttpGateway extends Wire implements SsrGatewayInterface
 			$v4List = @gethostbynamel($host);
 			if (is_array($v4List)) {
 				foreach ($v4List as $ip) {
-					if (is_string($ip) && $ip !== '') {
+					if ($ip !== '') {
 						$resolvedIps[] = $ip;
 					}
 				}
@@ -419,7 +419,7 @@ class HttpGateway extends Wire implements SsrGatewayInterface
 			$v6Records = @dns_get_record($host, DNS_AAAA);
 			if (is_array($v6Records)) {
 				foreach ($v6Records as $rec) {
-					if (is_array($rec) && isset($rec['ipv6']) && is_string($rec['ipv6']) && $rec['ipv6'] !== '') {
+					if (isset($rec['ipv6']) && is_string($rec['ipv6']) && $rec['ipv6'] !== '') {
 						$resolvedIps[] = $rec['ipv6'];
 					}
 				}
@@ -436,7 +436,7 @@ class HttpGateway extends Wire implements SsrGatewayInterface
 		}
 
 		if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false) {
-			$packed = @inet_pton($ip);
+			$packed = inet_pton($ip);
 
 			return is_string($packed) && strlen($packed) === 16 && $packed === str_repeat("\x00", 15) . "\x01";
 		}
@@ -451,7 +451,7 @@ class HttpGateway extends Wire implements SsrGatewayInterface
 	private function isSafeAllowedHostIp(string $ip): bool
 	{
 		if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false) {
-			$packed = @inet_pton($ip);
+			$packed = inet_pton($ip);
 			if (!is_string($packed) || strlen($packed) !== 4) {
 				return false;
 			}
@@ -466,7 +466,7 @@ class HttpGateway extends Wire implements SsrGatewayInterface
 		}
 
 		if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false) {
-			$packed = @inet_pton($ip);
+			$packed = inet_pton($ip);
 			if (!is_string($packed) || strlen($packed) !== 16) {
 				return false;
 			}
@@ -504,7 +504,7 @@ class HttpGateway extends Wire implements SsrGatewayInterface
 	private function logSsrFailure(string $message): void
 	{
 		try {
-			$this->wire()?->log?->save('inertia-ssr', $message);
+			$this->wire()->log->save('inertia-ssr', $message);
 		} catch (Throwable) {
 			// Guard against recursive logging errors when filesystem log is unwritable
 		}

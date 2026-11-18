@@ -6,6 +6,7 @@ namespace Totoglu\Inertia\Props;
 
 use Closure;
 use Totoglu\Inertia\Request;
+use Totoglu\Inertia\Support\PropResolver;
 
 /**
  * Prop wrapper instructing the client router to append, prepend, or deep-merge incoming data
@@ -26,6 +27,6 @@ class MergeProp implements PropInterface
 
 	public function __invoke(?Request $request = null): mixed
 	{
-		return $this->value instanceof Closure ? ($this->value)() : $this->value;
+		return $this->value instanceof Closure ? PropResolver::invokeCallback($this->value, $request) : $this->value;
 	}
 }

@@ -10,6 +10,7 @@ use JsonSerializable;
 use ProcessWire\Config;
 use ProcessWire\Field;
 use ProcessWire\Fieldgroup;
+use ProcessWire\Inertia;
 use ProcessWire\Inputfield;
 use ProcessWire\InputfieldPassword;
 use ProcessWire\InputfieldWrapper;
@@ -67,9 +68,13 @@ final class PropResolver extends Wire
 	/** @var array<int, true> */
 	private array $evaluatingObjects = [];
 
+	private ?object $omitSentinel = null;
+
 	private Request $activeRequest;
 
 	private string $activeComponent = '';
+
+	private ?Page $contextPage = null;
 
 	private ?int $defaultOnceTtl = null;
 
@@ -117,7 +122,12 @@ final class PropResolver extends Wire
 		private readonly ProviderRegistry $registry = new ProviderRegistry()
 	) {
 		parent::__construct();
-		$this->registry->wire($this);
+	}
+
+	public function wired(): void
+	{
+		parent::wired();
+		$this->wire($this->registry);
 	}
 
 	/**
@@ -149,7 +159,8 @@ final class PropResolver extends Wire
 	 *
 	 * @param array<string, mixed> $props Merged shared and page-level props
 	 * @return array{
-	 *     props: array<string, mixed>,
+	 *     props: array<int|string, mixed>,
+	 *     componentViewData?: array<string, mixed>,
 	 *     deferredProps?: array<string, list<string>>,
 	 *     mergeProps?: list<string>,
 	 *     deepMergeProps?: list<string>,
@@ -159,11 +170,17 @@ final class PropResolver extends Wire
 	 *     scrollProps?: array<string, array{pageName: string, previousPage: int|null, nextPage: int|null, currentPage: int, reset: bool}>
 	 * }
 	 */
-	public function resolve(string $component, array $props, Request $request, bool $ignoreExceptOnce = false): array
-	{
+	public function resolve(
+		string $component,
+		array $props,
+		Request $request,
+		bool $ignoreExceptOnce = false,
+		?Page $contextPage = null
+	): array {
+		$this->ensureModuleProvidersBooted();
 		$runner = clone $this;
 
-		return $runner->executeResolve($component, $props, $request, $ignoreExceptOnce);
+		return $runner->executeResolve($component, $props, $request, $ignoreExceptOnce, $contextPage);
 	}
 
 	/**
@@ -171,17 +188,95 @@ final class PropResolver extends Wire
 	 */
 	public function resolveValue(mixed $value, ?Request $request = null): mixed
 	{
+		$inertia = $this->ensureModuleProvidersBooted();
 		$runner = clone $this;
 		if ($request === null) {
-			$request = new Request();
-			if ($this->wire() !== null) {
+			if ($inertia instanceof Inertia) {
+				$request = $inertia->request;
+			} else {
+				$request = new Request();
 				$this->wire($request);
 			}
 		}
+		$currentPage = $this->wire()->page;
+		$contextPage = $currentPage instanceof Page && $currentPage->id > 0 ? $currentPage : null;
 		$runner->activeRequest = $request;
+		$runner->contextPage = $contextPage;
+		$runner->defaultOnceTtl = $runner->resolveTemplateCacheTtl($contextPage);
 		$runner->evaluatingObjects = [];
+		$runner->omitSentinel = new \stdClass();
 
 		return $runner->evaluateValue($value, '', true);
+	}
+
+	private function ensureModuleProvidersBooted(): ?Inertia
+	{
+		$inertia = $this->wire()->inertia;
+		if ($inertia instanceof Inertia && $inertia->resolver === $this) {
+			$inertia->providers();
+
+			return $inertia;
+		}
+
+		return null;
+	}
+
+	/**
+	 * Invoke a prop closure, injecting `$request` only when the callback's first parameter accepts a `Request` instance.
+	 */
+	public static function invokeCallback(Closure $callback, ?Request $request = null): mixed
+	{
+		$ref = new \ReflectionFunction($callback);
+		$params = $ref->getParameters();
+		if ($params === []) {
+			return $callback();
+		}
+
+		$first = $params[0];
+		if ($first->isVariadic()) {
+			return $callback();
+		}
+
+		$type = $first->getType();
+		$acceptsRequest = false;
+		if ($type === null) {
+			$acceptsRequest = !$ref->isInternal();
+		} elseif ($type instanceof \ReflectionNamedType) {
+			$typeName = $type->getName();
+			$acceptsRequest = $typeName === 'mixed' || $typeName === 'object' || is_a(Request::class, $typeName, true);
+		} elseif ($type instanceof \ReflectionUnionType) {
+			foreach ($type->getTypes() as $member) {
+				if ($member instanceof \ReflectionNamedType) {
+					$typeName = $member->getName();
+					if ($typeName === 'mixed' || $typeName === 'object' || is_a(Request::class, $typeName, true)) {
+						$acceptsRequest = true;
+						break;
+					}
+				}
+			}
+		} elseif ($type instanceof \ReflectionIntersectionType) {
+			$acceptsRequest = true;
+			foreach ($type->getTypes() as $member) {
+				if (!$member instanceof \ReflectionNamedType || !is_a(Request::class, $member->getName(), true)) {
+					$acceptsRequest = false;
+					break;
+				}
+			}
+		}
+
+		if ($acceptsRequest) {
+			if ($request !== null) {
+				return $callback($request);
+			}
+			if ($first->isOptional()) {
+				return $callback();
+			}
+			if ($first->allowsNull()) {
+				return $callback(null);
+			}
+		}
+
+		return $callback();
 	}
 
 	/**
@@ -214,7 +309,8 @@ final class PropResolver extends Wire
 	/**
 	 * @param array<string, mixed> $props
 	 * @return array{
-	 *     props: array<string, mixed>,
+	 *     props: array<int|string, mixed>,
+	 *     componentViewData?: array<string, mixed>,
 	 *     deferredProps?: array<string, list<string>>,
 	 *     mergeProps?: list<string>,
 	 *     deepMergeProps?: list<string>,
@@ -224,14 +320,20 @@ final class PropResolver extends Wire
 	 *     scrollProps?: array<string, array{pageName: string, previousPage: int|null, nextPage: int|null, currentPage: int, reset: bool}>
 	 * }
 	 */
-	private function executeResolve(string $component, array $props, Request $request, bool $ignoreExceptOnce = false): array
-	{
+	private function executeResolve(
+		string $component,
+		array $props,
+		Request $request,
+		bool $ignoreExceptOnce = false,
+		?Page $contextPage = null
+	): array {
 		$expanded = self::expandDotNotation($props);
 
 		$isInertia = $request->isInertia();
 
 		$this->activeRequest = $request;
 		$this->activeComponent = $component;
+		$this->contextPage = $contextPage;
 		$this->isPartial = $isInertia && $request->isPartial($component);
 		$this->only = $this->isPartial ? $request->partialOnly() : [];
 		$this->except = $this->isPartial ? $request->partialExcept() : [];
@@ -248,7 +350,8 @@ final class PropResolver extends Wire
 		$this->scrollProps = [];
 		$this->componentViewData = [];
 		$this->evaluatingObjects = [];
-		$this->defaultOnceTtl = $this->resolveTemplateCacheTtl();
+		$this->omitSentinel = new \stdClass();
+		$this->defaultOnceTtl = $this->resolveTemplateCacheTtl($contextPage);
 
 		// 1. Collect Deferred, Merge, Once, and Scroll metadata across top-level and dot-expanded nested arrays
 		$this->collectMetadata($expanded, '');
@@ -344,7 +447,7 @@ final class PropResolver extends Wire
 					$this->recordOnceMetadata($value, $path);
 				}
 			} elseif ($value instanceof OnceProp) {
-				if (!$this->isExcludedFromPartial($path)) {
+				if (!$this->isExcludedFromPartial($path) && $value->isOnce()) {
 					$this->recordOnceMetadata($value, $path);
 				}
 			} elseif ($value instanceof ScrollProp) {
@@ -442,12 +545,24 @@ final class PropResolver extends Wire
 	 */
 	private function evaluateArray(array $items, string $prefix, bool $bypassPartialFilter, int $depth = 0): array
 	{
+		$result = $this->evaluateArrayInternal($items, $prefix, $bypassPartialFilter, $depth);
+
+		return is_array($result) ? $result : [];
+	}
+
+	/**
+	 * @param array<int|string, mixed> $items
+	 * @return array<int|string, mixed>|object
+	 */
+	private function evaluateArrayInternal(array $items, string $prefix, bool $bypassPartialFilter, int $depth = 0): array|object
+	{
 		if ($depth >= self::MAX_EVAL_DEPTH) {
 			return [];
 		}
 
 		$isList = array_is_list($items);
 		$resolved = [];
+		$filteredByProtocol = false;
 
 		foreach ($items as $key => $value) {
 			if (!$isList && is_string($key) && in_array($key, ['__proto__', 'constructor', 'prototype'], true)) {
@@ -460,6 +575,7 @@ final class PropResolver extends Wire
 			if (!$isAlways) {
 				// OptionalProp and DeferredProp are ONLY evaluated when explicitly requested in `$only` during a partial reload
 				if (($value instanceof OptionalProp || $value instanceof DeferredProp) && !$this->isExplicitlyRequestedInPartial($path)) {
+					$filteredByProtocol = true;
 					continue;
 				}
 
@@ -469,15 +585,31 @@ final class PropResolver extends Wire
 					($value instanceof OnceProp || $value instanceof MergeProp)
 					&& $this->shouldSkipOnce($value, $path)
 				) {
+					$filteredByProtocol = true;
 					continue;
 				}
 
 				if ($this->isExcludedFromPartial($path)) {
+					$filteredByProtocol = true;
 					continue;
 				}
 			}
 
-			$resolved[$key] = $this->evaluateValue($value, $path, $value instanceof AlwaysProp || $bypassPartialFilter, $depth + 1);
+			$evaluatedChild = $this->evaluateValueInternal($value, $path, $value instanceof AlwaysProp || $bypassPartialFilter, $depth + 1);
+			if ($this->omitSentinel !== null && $evaluatedChild === $this->omitSentinel) {
+				if ($isList) {
+					$resolved[$key] = [];
+				} else {
+					$filteredByProtocol = true;
+				}
+				continue;
+			}
+
+			$resolved[$key] = $evaluatedChild;
+		}
+
+		if ($prefix !== '' && !$isList && $items !== [] && $resolved === [] && $filteredByProtocol && $this->omitSentinel !== null) {
+			return $this->omitSentinel;
 		}
 
 		return $isList ? array_values($resolved) : $resolved;
@@ -487,6 +619,13 @@ final class PropResolver extends Wire
 	 * Evaluate a single prop value to its JSON-ready representation.
 	 */
 	private function evaluateValue(mixed $value, string $path, bool $bypassPartialFilter, int $depth = 0): mixed
+	{
+		$result = $this->evaluateValueInternal($value, $path, $bypassPartialFilter, $depth);
+
+		return ($this->omitSentinel !== null && $result === $this->omitSentinel) ? [] : $result;
+	}
+
+	private function evaluateValueInternal(mixed $value, string $path, bool $bypassPartialFilter, int $depth = 0): mixed
 	{
 		if ($depth >= self::MAX_EVAL_DEPTH) {
 			return null;
@@ -510,8 +649,12 @@ final class PropResolver extends Wire
 
 				$value = $value($this->activeRequest);
 			} else {
-				$value = $value();
+				$value = self::invokeCallback($value, $this->activeRequest);
 			}
+		}
+
+		if (is_float($value) && !is_finite($value)) {
+			return null;
 		}
 
 		if (is_object($value)) {
@@ -557,6 +700,9 @@ final class PropResolver extends Wire
 				}
 
 				if ($value instanceof Language) {
+					if ($value->id <= 0 || $value->isTrash()) {
+						return null;
+					}
 					$user = $this->wire()->user;
 					$userLang = $user instanceof User ? $user->language : null;
 
@@ -570,6 +716,10 @@ final class PropResolver extends Wire
 				}
 
 				if ($value instanceof Role || $value instanceof Permission) {
+					if ($value->id <= 0 || $value->isTrash()) {
+						return null;
+					}
+
 					return [
 						'id' => (int) $value->id,
 						'name' => (string) $value->name,
@@ -578,11 +728,11 @@ final class PropResolver extends Wire
 				}
 
 				if ($value instanceof Pageimage) {
-					return $this->evaluateValue($this->registry->provideImage($value), $path, $bypassPartialFilter, $depth + 1);
+					return $this->evaluateValue($this->registry->provideImage($value, $this->contextPage), $path, $bypassPartialFilter, $depth + 1);
 				}
 
 				if ($value instanceof Pagefile) {
-					return $this->evaluateValue($this->registry->provideFile($value), $path, $bypassPartialFilter, $depth + 1);
+					return $this->evaluateValue($this->registry->provideFile($value, $this->contextPage), $path, $bypassPartialFilter, $depth + 1);
 				}
 
 				if ($value instanceof InputfieldWrapper) {
@@ -626,13 +776,25 @@ final class PropResolver extends Wire
 				}
 
 				if ($value instanceof Notice) {
+					if (!(bool) $this->wire()->config->debug && ((int) $value->flags & Notice::debug) !== 0) {
+						return null;
+					}
+
 					return $this->serializeNotice($value);
 				}
 
 				if ($value instanceof Notices) {
+					$isDebug = (bool) $this->wire()->config->debug;
 					$notices = [];
-					foreach ($value as $noticeItem) {
-						if ($noticeItem instanceof Notice) {
+					$visibleNotices = $value->getVisible();
+					if (is_iterable($visibleNotices)) {
+						foreach ($visibleNotices as $noticeItem) {
+							if (!$noticeItem instanceof Notice) {
+								continue;
+							}
+							if (!$isDebug && ((int) $noticeItem->flags & Notice::debug) !== 0) {
+								continue;
+							}
 							$notices[] = $this->serializeNotice($noticeItem);
 						}
 					}
@@ -642,23 +804,24 @@ final class PropResolver extends Wire
 
 				$objectProvider = $this->registry->resolveObjectProvider($value);
 				if ($objectProvider !== null) {
-					return $this->evaluateValue($objectProvider->transform($value), $path, $bypassPartialFilter, $depth + 1);
+					return $this->evaluateValue($objectProvider->transform($value, null, $this->contextPage), $path, $bypassPartialFilter, $depth + 1);
 				}
 
 				if ($value instanceof Page) {
 					/** @var Page|null $currentPage */
-					$currentPage = $this->wire()->page;
-					if (!TemplateDataProvider::isAccessiblePage($value, true, $currentPage instanceof Page ? $currentPage : null)) {
+					$currentPage = $this->contextPage ?? $this->wire()->page;
+					$effectiveCurrentPage = $currentPage instanceof Page ? $currentPage : null;
+					if (!TemplateDataProvider::isAccessiblePage($value, true, $effectiveCurrentPage)) {
 						return null;
 					}
 
-					return $this->evaluateValue($this->registry->providePage($value), $path, $bypassPartialFilter, $depth + 1);
+					return $this->evaluateValue($this->registry->providePage($value, $effectiveCurrentPage), $path, $bypassPartialFilter, $depth + 1);
 				}
 
 				if ($value instanceof PageArray) {
 					$items = [];
 					foreach ($value as $item) {
-						if ($item instanceof Page && !TemplateDataProvider::isAccessiblePage($item)) {
+						if (!TemplateDataProvider::isAccessiblePage($item)) {
 							continue;
 						}
 						$items[] = $item;
@@ -670,7 +833,7 @@ final class PropResolver extends Wire
 				if ($value instanceof Pagefiles) {
 					$items = [];
 					foreach ($value as $item) {
-						if ($item instanceof Pagefile && !MediaFieldDataProvider::isAccessiblePagefile($item)) {
+						if ($item instanceof Pagefile && !MediaFieldDataProvider::isAccessiblePagefile($item, $this->contextPage)) {
 							continue;
 						}
 						$items[] = $item;
@@ -708,7 +871,7 @@ final class PropResolver extends Wire
 		}
 
 		if (is_array($value)) {
-			return $this->evaluateArray($value, $path, $bypassPartialFilter, $depth + 1);
+			return $this->evaluateArrayInternal($value, $path, $bypassPartialFilter, $depth + 1);
 		}
 
 		return $value;
@@ -734,21 +897,24 @@ final class PropResolver extends Wire
 			if (!$child instanceof Inputfield) {
 				continue;
 			}
-			$childKey = (string) ($child->attr('name') ?: $child->className());
+			$childAttrName = Request::scalarString($child->attr('name'));
+			$childKey = $childAttrName !== '' ? $childAttrName : $child->className();
 			$childPath = $path === '' ? $childKey : $path . '.' . $childKey;
 			$fields[] = $this->evaluateValue($child, $childPath, $bypassPartialFilter, $depth + 1);
 		}
 
+		$methodAttr = Request::scalarString($wrapper->attr('method'));
+
 		return [
 			'component' => $wrapper->className(),
-			'id' => (string) $wrapper->attr('id'),
-			'name' => (string) $wrapper->attr('name'),
+			'id' => Request::scalarString($wrapper->attr('id')),
+			'name' => Request::scalarString($wrapper->attr('name')),
 			'label' => (string) $wrapper->label,
 			'description' => (string) $wrapper->description,
 			'notes' => (string) $wrapper->notes,
 			'icon' => (string) $wrapper->icon,
-			'action' => (string) $wrapper->attr('action'),
-			'method' => (string) ($wrapper->attr('method') ?: 'post'),
+			'action' => Request::scalarString($wrapper->attr('action')),
+			'method' => $methodAttr !== '' ? $methodAttr : 'post',
 			'collapsed' => (int) $wrapper->collapsed,
 			'columnWidth' => (int) ($wrapper->columnWidth ?: 100),
 			'showIf' => (string) $wrapper->showIf,
@@ -771,17 +937,19 @@ final class PropResolver extends Wire
 		}
 
 		$typeName = str_replace('Inputfield', '', $field->className());
+		$fieldAttrType = Request::scalarString($field->attr('type'));
+		$fieldAttrName = Request::scalarString($field->attr('name'));
 		$isPassword = $field instanceof InputfieldPassword
 			|| strtolower($typeName) === 'password'
-			|| strtolower((string) $field->attr('type')) === 'password'
-			|| strtolower((string) $field->attr('name')) === 'pass';
+			|| strtolower($fieldAttrType) === 'password'
+			|| strtolower($fieldAttrName) === 'pass';
 		$rawValue = $isPassword ? '' : $field->attr('value');
 
 		return [
 			'component' => $field->className(),
 			'type' => $typeName,
-			'id' => (string) $field->attr('id'),
-			'name' => (string) $field->attr('name'),
+			'id' => Request::scalarString($field->attr('id')),
+			'name' => $fieldAttrName,
 			'label' => (string) $field->label,
 			'description' => (string) $field->description,
 			'notes' => (string) $field->notes,
@@ -804,10 +972,11 @@ final class PropResolver extends Wire
 	{
 		$flags = (int) $notice->flags;
 		$allowMarkup = ($flags & Notice::allowMarkup) !== 0;
-		$rawText = trim((string) $notice->text);
-		$safeText = $allowMarkup
-			? $rawText
-			: $this->wire()->sanitizer->entities($rawText);
+		$safeText = Inertia::formatNoticeText(
+			Request::scalarString($notice->text),
+			$flags,
+			$this->wire()->sanitizer
+		);
 
 		return [
 			'type' => $notice instanceof NoticeError ? 'error' : ($notice instanceof NoticeWarning ? 'warning' : 'message'),
@@ -910,6 +1079,27 @@ final class PropResolver extends Wire
 		return in_array($trackingKey, $this->exceptOnce, true) || in_array($path, $this->exceptOnce, true);
 	}
 
+	private function hasPartialSubPathFilter(string $path): bool
+	{
+		if ($path === '' || !$this->isPartial) {
+			return false;
+		}
+
+		$prefix = $path . '.';
+		foreach ($this->only as $pattern) {
+			if (str_starts_with($pattern, $prefix)) {
+				return true;
+			}
+		}
+		foreach ($this->except as $pattern) {
+			if (str_starts_with($pattern, $prefix)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	/**
 	 * Evaluate a `OnceProp` (or any prop with `->once()`), caching its resolved JSON-ready value in `WireCache`
 	 * when an explicit `->until(...)` or active `$page->template->cache_time` TTL is configured.
@@ -922,7 +1112,12 @@ final class PropResolver extends Wire
 	): mixed {
 		$trackingKey = $prop->key() ?? $path;
 		$effectiveTtl = $prop->ttlSeconds($this->defaultOnceTtl);
-		$hasDynamicContext = $this->isPartial
+		$blocksPartialCache = $this->isPartial && (
+			!($prop instanceof DeferredProp || $prop instanceof OptionalProp)
+			|| $this->isResetPath($path)
+			|| $this->hasPartialSubPathFilter($path)
+		);
+		$hasDynamicContext = $blocksPartialCache
 			|| $this->activeRequest->isMutatingMethod()
 			|| $this->activeRequest->json() !== []
 			|| $this->activeRequest->getArray() !== []
@@ -937,7 +1132,7 @@ final class PropResolver extends Wire
 					return $cached['value'];
 				}
 			} catch (Throwable $e) {
-				$this->wire()?->log?->error('Inertia OnceProp cache read failed: ' . $e->getMessage());
+				$this->wire()->log->error('Inertia OnceProp cache read failed: ' . $e->getMessage());
 			}
 		}
 
@@ -956,7 +1151,7 @@ final class PropResolver extends Wire
 					$effectiveTtl
 				);
 			} catch (Throwable $e) {
-				$this->wire()?->log?->error('Inertia OnceProp cache write failed: ' . $e->getMessage());
+				$this->wire()->log->error('Inertia OnceProp cache write failed: ' . $e->getMessage());
 			}
 		}
 
@@ -972,7 +1167,7 @@ final class PropResolver extends Wire
 		try {
 			$wire = $this->wire();
 			/** @var Page|null $page */
-			$page = $wire->page;
+			$page = $this->contextPage ?? $wire->page;
 			if (!$page instanceof Page || $page->id <= 0) {
 				return null;
 			}
@@ -985,18 +1180,40 @@ final class PropResolver extends Wire
 			$authSegment = ($user instanceof User && $user->isLoggedin())
 				? ':u' . (int) $user->id
 				: ':guest';
+			$roleSegment = '';
+			if ($user instanceof User) {
+				$roleIds = [];
+				$rolesField = $user->get('roles');
+				if (is_iterable($rolesField)) {
+					foreach ($rolesField as $role) {
+						if ($role instanceof Role && $role->id > 0) {
+							$roleIds[] = (int) $role->id;
+						}
+					}
+				}
+				sort($roleIds);
+				$roleSegment = implode(',', array_unique($roleIds));
+			}
 
 			$input = $wire->input;
 			$config = $wire->config;
-			$scheme = ((bool) ($config?->https ?? false)) ? 'https' : 'http';
-			$host = strtolower(trim((string) ($config?->httpHost ?? '')));
-			$urlSegmentStr = trim((string) ($input?->urlSegmentStr ?? ''), '/');
-			$pageNum = (int) ($input?->pageNum() ?? 1);
-			$digest = hash('xxh128', $scheme . '://' . $host . "\0" . $this->activeComponent . "\0" . $urlSegmentStr . "\0n" . $pageNum . "\0" . $trackingKey);
+			$scheme = ((bool) $config->https) ? 'https' : 'http';
+			$host = strtolower(trim((string) $config->httpHost));
+			$urlSegmentStr = trim((string) $input->urlSegmentStr, '/');
+			$pageNum = (int) $input->pageNum();
+			$digest = hash(
+				'xxh128',
+				$scheme . '://' . $host
+				. "\0" . $this->activeComponent
+				. "\0" . $urlSegmentStr
+				. "\0n" . $pageNum
+				. "\0r" . $roleSegment
+				. "\0" . $trackingKey
+			);
 
 			return "p{$page->id}:l{$langId}{$authSegment}:{$digest}";
 		} catch (Throwable $e) {
-			$this->wire()?->log?->error('Inertia OnceProp cache key resolution failed: ' . $e->getMessage());
+			$this->wire()->log->error('Inertia OnceProp cache key resolution failed: ' . $e->getMessage());
 
 			return null;
 		}
@@ -1011,7 +1228,7 @@ final class PropResolver extends Wire
 		try {
 			$wire = $this->wire();
 			/** @var Page|null $targetPage */
-			$targetPage = $page ?? $wire->page;
+			$targetPage = $page ?? $this->contextPage ?? $wire->page;
 			if (!$targetPage instanceof Page || $targetPage->id <= 0) {
 				return null;
 			}
@@ -1033,7 +1250,7 @@ final class PropResolver extends Wire
 
 			return $cacheTime;
 		} catch (Throwable $e) {
-			$this->wire()?->log?->error('Inertia template cache TTL resolution failed: ' . $e->getMessage());
+			$this->wire()->log->error('Inertia template cache TTL resolution failed: ' . $e->getMessage());
 
 			return null;
 		}
@@ -1095,7 +1312,15 @@ final class PropResolver extends Wire
 			} elseif ($cacheExpire === Template::cacheExpireSelector) {
 				$selector = trim((string) $template->cacheExpireSelector);
 				if ($selector !== '') {
+					if (!self::hasPositiveTopLevelLimit($selector)) {
+						$selector .= ', limit=251';
+					}
 					$matchedIds = $wire->pages->findIDs($selector, ['findHidden' => true]);
+					if (count($matchedIds) > 250) {
+						$cache->deleteFor(self::ONCE_CACHE_NAMESPACE);
+
+						return;
+					}
 					foreach ($matchedIds as $id) {
 						$intId = (int) $id;
 						if ($intId > 0) {
@@ -1105,7 +1330,14 @@ final class PropResolver extends Wire
 				}
 			}
 
-			foreach (array_unique($pageIds) as $id) {
+			$uniqueIds = array_unique($pageIds);
+			if (count($uniqueIds) > 250) {
+				$cache->deleteFor(self::ONCE_CACHE_NAMESPACE);
+
+				return;
+			}
+
+			foreach ($uniqueIds as $id) {
 				$cache->deleteFor(self::ONCE_CACHE_NAMESPACE, "p{$id}:*");
 			}
 		} catch (Throwable $e) {
@@ -1116,6 +1348,50 @@ final class PropResolver extends Wire
 	private function isResetPath(string $path): bool
 	{
 		return $this->reset !== [] && self::matchesExactOrParent($path, $this->reset);
+	}
+
+	private static function hasPositiveTopLevelLimit(string $selector): bool
+	{
+		$depth = 0;
+		$quote = '';
+		$clause = '';
+		$len = strlen($selector);
+
+		for ($i = 0; $i <= $len; $i++) {
+			$ch = $i < $len ? $selector[$i] : ',';
+			if ($quote !== '') {
+				if ($ch === $quote && ($i === 0 || $selector[$i - 1] !== '\\')) {
+					$quote = '';
+				}
+				$clause .= $ch;
+				continue;
+			}
+			if ($ch === '"' || $ch === "'") {
+				$quote = $ch;
+				$clause .= $ch;
+				continue;
+			}
+			if ($ch === '[' || $ch === '(') {
+				$depth++;
+				$clause .= $ch;
+				continue;
+			}
+			if ($ch === ']' || $ch === ')') {
+				$depth = max(0, $depth - 1);
+				$clause .= $ch;
+				continue;
+			}
+			if ($ch === ',' && $depth === 0) {
+				if (preg_match('/^\s*limit\s*=\s*([0-9]+)\s*$/i', $clause, $m) === 1 && (int) $m[1] >= 1) {
+					return true;
+				}
+				$clause = '';
+				continue;
+			}
+			$clause .= $ch;
+		}
+
+		return false;
 	}
 
 	private static function qualifySubPath(string $baseKey, string $subPath): string

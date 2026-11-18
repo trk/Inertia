@@ -9,6 +9,7 @@ use ProcessWire\Page;
 use ProcessWire\PaginatedArray;
 use Totoglu\Inertia\Provider\TemplateDataProvider;
 use Totoglu\Inertia\Request;
+use Totoglu\Inertia\Support\PropResolver;
 
 /**
  * Wraps a paginated dataset (`PaginatedArray`, `PageArray`, `Closure`, or array) and generates
@@ -25,6 +26,8 @@ final class ScrollProp implements PropInterface
 
 	private ?int $customPreviousPage = null;
 
+	private bool $hasCustomMeta = false;
+
 	private bool $resolved = false;
 
 	private ?int $resolvedPageNumber = null;
@@ -35,11 +38,19 @@ final class ScrollProp implements PropInterface
 	/** @var array{pageName: string, previousPage: int|null, nextPage: int|null, currentPage: int} */
 	private array $resolvedMeta;
 
+	private readonly string $wrapper;
+
+	private readonly string $pageName;
+
 	public function __construct(
 		private readonly mixed $value,
-		private readonly string $wrapper = 'data',
-		private readonly string $pageName = 'page'
+		string $wrapper = 'data',
+		string $pageName = 'page'
 	) {
+		$trimmedWrapper = trim($wrapper);
+		$trimmedPageName = trim($pageName);
+		$this->wrapper = $trimmedWrapper !== '' ? $trimmedWrapper : 'data';
+		$this->pageName = $trimmedPageName !== '' ? $trimmedPageName : 'page';
 		$this->resolvedMeta = [
 			'pageName' => $this->pageName,
 			'previousPage' => null,
@@ -84,9 +95,11 @@ final class ScrollProp implements PropInterface
 	 */
 	public function withMeta(int $currentPage, ?int $nextPage = null, ?int $previousPage = null): self
 	{
+		$this->hasCustomMeta = true;
 		$this->customCurrentPage = max(1, $currentPage);
 		$this->customNextPage = $nextPage;
 		$this->customPreviousPage = $previousPage;
+		$this->resolved = false;
 
 		return $this;
 	}
@@ -134,8 +147,12 @@ final class ScrollProp implements PropInterface
 			$count = $raw->count();
 
 			$currentPage = $this->customCurrentPage ?? ($limit > 0 ? (int) floor($start / $limit) + 1 : 1);
-			$previousPage = $this->customPreviousPage ?? ($currentPage > 1 ? $currentPage - 1 : null);
-			$nextPage = $this->customNextPage ?? (($limit > 0 && ($start + $count) < $total) ? $currentPage + 1 : null);
+			$previousPage = $this->hasCustomMeta
+				? $this->customPreviousPage
+				: ($currentPage > 1 ? $currentPage - 1 : null);
+			$nextPage = $this->hasCustomMeta
+				? $this->customNextPage
+				: (($limit > 0 && ($start + $count) < $total) ? $currentPage + 1 : null);
 
 			$items = [];
 			foreach ($raw as $item) {
@@ -161,10 +178,19 @@ final class ScrollProp implements PropInterface
 
 		if (is_array($raw) && array_key_exists($this->wrapper, $raw)) {
 			$currentPage = $this->customCurrentPage ?? (int) ($raw['currentPage'] ?? $requestedPage);
+			$hasExplicitPrev = array_key_exists('previousPage', $raw);
 			$rawPrev = $raw['previousPage'] ?? null;
 			$rawNext = $raw['nextPage'] ?? null;
-			$previousPage = $this->customPreviousPage ?? ($rawPrev !== null ? (int) $rawPrev : ($currentPage > 1 ? $currentPage - 1 : null));
-			$nextPage = $this->customNextPage ?? ($rawNext !== null ? (int) $rawNext : null);
+			$previousPage = $this->hasCustomMeta
+				? $this->customPreviousPage
+				: (
+					$hasExplicitPrev
+						? ($rawPrev !== null ? (int) $rawPrev : null)
+						: ($currentPage > 1 ? $currentPage - 1 : null)
+				);
+			$nextPage = $this->hasCustomMeta
+				? $this->customNextPage
+				: ($rawNext !== null ? (int) $rawNext : null);
 
 			$this->resolvedMeta = [
 				'pageName' => (string) ($raw['pageName'] ?? $this->pageName),
@@ -181,7 +207,9 @@ final class ScrollProp implements PropInterface
 		$currentPage = $this->customCurrentPage ?? $requestedPage;
 		$this->resolvedMeta = [
 			'pageName' => $this->pageName,
-			'previousPage' => $this->customPreviousPage ?? ($currentPage > 1 ? $currentPage - 1 : null),
+			'previousPage' => $this->hasCustomMeta
+				? $this->customPreviousPage
+				: ($currentPage > 1 ? $currentPage - 1 : null),
 			'nextPage' => $this->customNextPage,
 			'currentPage' => $currentPage,
 		];
@@ -198,19 +226,19 @@ final class ScrollProp implements PropInterface
 		}
 
 		if ($request === null) {
-			return ($this->value)();
+			return PropResolver::invokeCallback($this->value, null);
 		}
 
 		$input = $request->wireInput();
 		if ($input === null) {
-			return ($this->value)();
+			return PropResolver::invokeCallback($this->value, $request);
 		}
 
 		$previousPageNum = (int) $input->pageNum();
 		$input->setPageNum($requestedPage);
 
 		try {
-			return ($this->value)();
+			return PropResolver::invokeCallback($this->value, $request);
 		} finally {
 			$input->setPageNum($previousPageNum);
 		}

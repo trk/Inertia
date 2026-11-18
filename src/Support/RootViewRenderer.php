@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Totoglu\Inertia\Support;
 
 use Closure;
+use ProcessWire\Fuel;
 use ProcessWire\Inertia;
 use ProcessWire\Page;
 use ProcessWire\Process;
@@ -54,7 +55,7 @@ final class RootViewRenderer extends Wire
 		array $sharedViewData,
 		?SsrResponse $ssr
 	): string {
-		$wire = $this->wire() ?? $this->module->wire();
+		$wire = $this->wire();
 		$config = $wire->config;
 		$files = $wire->files;
 		$templatesPath = rtrim((string) $config->paths->templates, '/\\');
@@ -71,7 +72,9 @@ final class RootViewRenderer extends Wire
 			? $viewName
 			: ($templatesPath !== '' ? $templatesPath . '/' . ltrim($viewName, '/') : '');
 
-		$resolvedCandidate = $candidatePath !== '' && is_file($candidatePath) ? realpath($candidatePath) : false;
+		$resolvedCandidate = $candidatePath !== '' && !is_link($candidatePath) && is_file($candidatePath)
+			? realpath($candidatePath)
+			: false;
 		$realTemplatesDir = $templatesPath !== '' && is_dir($templatesPath) ? realpath($templatesPath) : false;
 		$realSiteModulesDir = $siteModulesPath !== '' && is_dir($siteModulesPath) ? realpath($siteModulesPath) : false;
 		$realStubsDir = is_dir($this->stubsPath) ? realpath($this->stubsPath) : false;
@@ -118,8 +121,9 @@ final class RootViewRenderer extends Wire
 			(array) $pageResponse->getViewData()
 		);
 
-		$reservedFuel = is_object($wire->fuel) && method_exists($wire->fuel, 'getArray')
-			? array_keys($wire->fuel->getArray())
+		$allFuel = $wire->wire('all');
+		$reservedFuel = $allFuel instanceof Fuel
+			? array_keys($allFuel->getArray())
 			: [];
 		foreach (array_keys($vars) as $varKey) {
 			if (
@@ -160,9 +164,27 @@ final class RootViewRenderer extends Wire
 				: '';
 		}
 		$headParts = array_values(array_filter([$ssrHead, $customHead], static fn(string $part): bool => $part !== ''));
+		$combinedHead = implode("\n\t", $headParts);
+
+		if (preg_match('/<title\b/i', $combinedHead) !== 1) {
+			$targetHasTitle = is_file($targetFile) && preg_match('/<title\b/i', (string) file_get_contents($targetFile)) === 1;
+			if (!$targetHasTitle) {
+				$props = isset($pageObject['props']) && is_array($pageObject['props']) ? $pageObject['props'] : [];
+				$pageProp = isset($props['page']) && is_array($props['page']) ? $props['page'] : [];
+				$rawTitle = $props['browserTitle']
+					?? $pageProp['title']
+					?? $props['title']
+					?? (($currentPage instanceof Page && (string) $currentPage->title !== '')
+						? (string) $currentPage->title
+						: ((string) $config->httpHost ?: 'Inertia'));
+				$fallbackTitle = is_scalar($rawTitle) && trim((string) $rawTitle) !== '' ? trim((string) $rawTitle) : 'Inertia';
+				$titleTag = '<title inertia>' . $wire->sanitizer->entities($fallbackTitle) . '</title>';
+				$combinedHead = $combinedHead !== '' ? $titleTag . "\n\t" . $combinedHead : $titleTag;
+			}
+		}
 
 		$vars['locale'] = $locale;
-		$vars['head'] = implode("\n\t", $headParts);
+		$vars['head'] = $combinedHead;
 		$vars['inertia'] = $this->module;
 		$vars['pageObject'] = $pageObject;
 

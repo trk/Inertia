@@ -14,7 +14,7 @@ use Totoglu\Inertia\Contracts\InertiaSerializable;
  * Serializes to `['component' => string, 'props' => array]` when passed as an Inertia prop,
  * or renders a `<div class="pw-inertia-island" data-inertia-island="...">` mount node on classic pages.
  *
- * @method string render(array $props = [])
+ * @method string render(array<string, mixed> $props = [])
  */
 abstract class MarkupInertia extends ModuleJS implements InertiaSerializable
 {
@@ -58,24 +58,31 @@ abstract class MarkupInertia extends ModuleJS implements InertiaSerializable
 	 */
 	public function ___render(array $props = []): string
 	{
-		if ($props !== []) {
-			$this->with($props);
+		$previousProps = $this->inertiaProps;
+		try {
+			if ($props !== []) {
+				$this->with($props);
+			}
+
+			$this->renderReady();
+
+			$payload = Inertia::withoutEntityEncoding(
+				fn(): mixed => $this->inertia()->resolver->resolveValue($this->toInertiaProp())
+			);
+			$component = is_array($payload) && is_string($payload['component'] ?? null)
+				? $payload['component']
+				: $this->inertiaComponent();
+			$resolvedProps = is_array($payload) && is_array($payload['props'] ?? null)
+				? $payload['props']
+				: [];
+
+			$safeComponent = $this->encodeHtmlAttribute($component);
+			$jsonProps = json_encode($resolvedProps, Inertia::JSON_HTML_SAFE_FLAGS);
+			$safeProps = $this->encodeHtmlAttribute(is_string($jsonProps) ? $jsonProps : '{}');
+
+			return "<div class=\"pw-inertia-island\" data-inertia-island=\"{$safeComponent}\" data-props=\"{$safeProps}\"></div>";
+		} finally {
+			$this->inertiaProps = $previousProps;
 		}
-
-		$this->renderReady();
-
-		$payload = $this->inertia()->resolver->resolveValue($this->toInertiaProp());
-		$component = is_array($payload) && is_string($payload['component'] ?? null)
-			? $payload['component']
-			: $this->inertiaComponent();
-		$resolvedProps = is_array($payload) && is_array($payload['props'] ?? null)
-			? $payload['props']
-			: [];
-
-		$safeComponent = $this->encodeHtmlAttribute($component);
-		$jsonProps = json_encode($resolvedProps, Inertia::JSON_HTML_SAFE_FLAGS);
-		$safeProps = $this->encodeHtmlAttribute(is_string($jsonProps) ? $jsonProps : '{}');
-
-		return "<div class=\"pw-inertia-island\" data-inertia-island=\"{$safeComponent}\" data-props=\"{$safeProps}\"></div>";
 	}
 }

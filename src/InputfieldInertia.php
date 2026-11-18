@@ -63,26 +63,6 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 		return is_string($encoded) ? $encoded : '';
 	}
 
-	/**
-	 * Reserved superglobal and prototype-pollution keys stripped from decoded JSON input.
-	 *
-	 * @var list<string>
-	 */
-	private const array BLOCKED_JSON_KEYS = [
-		'GLOBALS',
-		'_GET',
-		'_POST',
-		'_COOKIE',
-		'_REQUEST',
-		'_SERVER',
-		'_ENV',
-		'_FILES',
-		'_SESSION',
-		'__proto__',
-		'constructor',
-		'prototype',
-	];
-
 	protected function sanitizeInertiaInput(mixed $raw): mixed
 	{
 		if (is_string($raw) && $this->decodeJsonInput()) {
@@ -96,36 +76,12 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 			) {
 				$decoded = json_decode($trimmed, true, Request::MAX_JSON_DEPTH);
 				if (json_last_error() === JSON_ERROR_NONE) {
-					return is_array($decoded) ? $this->sanitizeDecodedJsonTree($decoded) : $decoded;
+					return is_array($decoded) ? Request::sanitizeInputTree($decoded) : $decoded;
 				}
 			}
 		}
 
 		return $raw;
-	}
-
-	/**
-	 * @param array<mixed, mixed> $data
-	 * @return array<string|int, mixed>
-	 */
-	private function sanitizeDecodedJsonTree(array $data, int $depth = 0): array
-	{
-		if ($depth >= Request::MAX_JSON_DEPTH) {
-			return [];
-		}
-
-		$clean = [];
-		foreach ($data as $key => $value) {
-			if (
-				is_string($key)
-				&& ($key === '' || strlen($key) > 128 || preg_match('/[\x00-\x20\x7F]/', $key) === 1 || in_array($key, self::BLOCKED_JSON_KEYS, true))
-			) {
-				continue;
-			}
-			$clean[$key] = is_array($value) ? $this->sanitizeDecodedJsonTree($value, $depth + 1) : $value;
-		}
-
-		return $clean;
 	}
 
 	/**
@@ -135,8 +91,8 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 	{
 		return [
 			'component' => $this->inertiaComponent(),
-			'id' => (string) $this->attr('id'),
-			'name' => (string) $this->attr('name'),
+			'id' => Request::scalarString($this->attr('id')),
+			'name' => Request::scalarString($this->attr('name')),
 			'label' => (string) $this->label,
 			'description' => (string) $this->description,
 			'notes' => (string) $this->notes,
@@ -161,11 +117,17 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 
 	public function ___render(): string
 	{
-		$payload = $this->inertia()->resolver->resolveValue($this->toInertiaProp());
-		$data = is_array($payload) ? $payload : $this->toInertiaProp();
+		$this->inertia()->ensureXsrfCookie();
+		$data = Inertia::withoutEntityEncoding(function (): array {
+			$raw = $this->toInertiaProp();
+			$payload = $this->inertia()->resolver->resolveValue($raw);
 
-		$id = (string) ($this->attr('id') ?: ($this->attr('name') ?: 'inertia_input'));
-		$name = (string) $this->attr('name');
+			return is_array($payload) ? $payload : $raw;
+		});
+
+		$attrId = Request::scalarString($this->attr('id'));
+		$name = Request::scalarString($this->attr('name'));
+		$id = $attrId !== '' ? $attrId : ($name !== '' ? $name : 'inertia_input');
 		$component = is_string($data['component'] ?? null) ? $data['component'] : $this->inertiaComponent();
 		$hiddenVal = $this->serializeValueForHiddenInput($this->attr('value'));
 
@@ -189,8 +151,12 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 
 	public function ___renderValue(): string
 	{
-		$payload = $this->inertia()->resolver->resolveValue($this->toInertiaProp());
-		$data = is_array($payload) ? $payload : $this->toInertiaProp();
+		$data = Inertia::withoutEntityEncoding(function (): array {
+			$raw = $this->toInertiaProp();
+			$payload = $this->inertia()->resolver->resolveValue($raw);
+
+			return is_array($payload) ? $payload : $raw;
+		});
 		$data['readOnly'] = true;
 
 		$component = is_string($data['component'] ?? null) ? $data['component'] : $this->inertiaComponent();
@@ -204,6 +170,8 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 
 	/**
 	 * Replace `value` directly so array<->scalar transitions do not merge with previous array values.
+	 *
+	 * #pw-internal
 	 *
 	 * @param string|array<string, mixed> $key
 	 * @param mixed $value
@@ -225,7 +193,7 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 			return $this;
 		}
 
-		$name = (string) $this->attr('name');
+		$name = Request::scalarString($this->attr('name'));
 		if ($name === '' || !isset($input->$name)) {
 			return $this;
 		}
@@ -237,7 +205,7 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 			if (!$this->trackChanges()) {
 				$this->setTrackChanges(true);
 			}
-			$this->setAttribute('value', $sanitized);
+			$this->attr('value', $sanitized);
 			$this->trackChange('value');
 		}
 

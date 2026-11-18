@@ -6,6 +6,7 @@ namespace Totoglu\Inertia\Props;
 
 use Closure;
 use Totoglu\Inertia\Request;
+use Totoglu\Inertia\Support\PropResolver;
 
 /**
  * Prop wrapper evaluated once and cached across subsequent client navigations
@@ -25,6 +26,6 @@ final class OnceProp implements PropInterface
 
 	public function __invoke(?Request $request = null): mixed
 	{
-		return ($this->callback)();
+		return PropResolver::invokeCallback($this->callback, $request);
 	}
 }

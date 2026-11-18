@@ -6,6 +6,7 @@ namespace Totoglu\Inertia\Props;
 
 use Closure;
 use Totoglu\Inertia\Request;
+use Totoglu\Inertia\Support\PropResolver;
 
 /**
  * Prop wrapper omitted on initial page visits and announced under `deferredProps[$group]`
@@ -43,6 +44,6 @@ final class DeferredProp implements PropInterface
 
 	public function __invoke(?Request $request = null): mixed
 	{
-		return ($this->callback)();
+		return PropResolver::invokeCallback($this->callback, $request);
 	}
 }

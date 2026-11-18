@@ -90,7 +90,16 @@ final class Response implements Stringable
 			return $this;
 		}
 
-		$isNavHeader = in_array(strtolower($cleanName), ['location', 'x-inertia-location', 'x-inertia-redirect'], true);
+		$lowerName = strtolower($cleanName);
+		$isNavHeader = in_array($lowerName, ['location', 'x-inertia-location', 'x-inertia-redirect'], true);
+		if ($isNavHeader) {
+			foreach (['Location', 'X-Inertia-Location', 'X-Inertia-Redirect'] as $navHeader) {
+				if (strcasecmp($navHeader, $cleanName) !== 0) {
+					$this->removeHeader($navHeader, $emitNow);
+				}
+			}
+		}
+
 		$clean = $isNavHeader ? $this->sanitizeNavigationUrl($value) : $this->safeHeaderValue($value);
 		foreach (array_keys($this->headers) as $existingKey) {
 			if ($existingKey !== $cleanName && strcasecmp($existingKey, $cleanName) === 0) {
@@ -102,6 +111,25 @@ final class Response implements Stringable
 		if ($emitNow && !headers_sent()) {
 			header("{$cleanName}: {$clean}");
 			$this->emittedHeaders[$cleanName] = $clean;
+		}
+
+		return $this;
+	}
+
+	public function removeHeader(string $name, bool $emitNow = true): self
+	{
+		$cleanName = (string) preg_replace('/[^!#$%&\'*+.^_`|~0-9A-Za-z-]/', '', trim($name));
+		if ($cleanName === '') {
+			return $this;
+		}
+
+		foreach (array_keys($this->headers) as $existingKey) {
+			if (strcasecmp($existingKey, $cleanName) === 0) {
+				unset($this->headers[$existingKey], $this->emittedHeaders[$existingKey]);
+				if ($emitNow && !headers_sent() && function_exists('header_remove')) {
+					header_remove($existingKey);
+				}
+			}
 		}
 
 		return $this;

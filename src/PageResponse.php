@@ -56,6 +56,7 @@ class PageResponse extends Wire implements JsonSerializable, Stringable
 		?Page $page = null,
 		?Process $process = null
 	) {
+		parent::__construct();
 		$this->page = $page;
 		$this->process = $process;
 		$this->module->wire($this);
@@ -282,7 +283,7 @@ class PageResponse extends Wire implements JsonSerializable, Stringable
 	{
 		$encoded = json_encode(
 			$this->toPageObject(),
-			JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_INVALID_UTF8_SUBSTITUTE
+			JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PARTIAL_OUTPUT_ON_ERROR
 		);
 
 		return is_string($encoded) ? $encoded : '{}';

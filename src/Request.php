@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Totoglu\Inertia;
 
+use ProcessWire\SessionCSRF;
 use ProcessWire\Wire;
 use ProcessWire\WireInput;
 use ProcessWire\WirePermissionException;
@@ -38,7 +39,7 @@ class Request extends Wire
 	 *
 	 * @var list<string>
 	 */
-	private const array BLOCKED_INPUT_KEYS = [
+	public const array BLOCKED_INPUT_KEYS = [
 		'GLOBALS',
 		'_GET',
 		'_POST',
@@ -56,10 +57,10 @@ class Request extends Wire
 	/** @var array<string, string> Test/runtime header overrides */
 	private array $headerOverrides = [];
 
-	/** @var array<string, mixed>|null Cached parsed JSON body */
+	/** @var array<int|string, mixed>|null Cached parsed JSON body */
 	private ?array $jsonBody = null;
 
-	/** @var array<string, mixed>|null Cached parsed URL-encoded form body for non-POST mutating verbs */
+	/** @var array<int|string, mixed>|null Cached parsed URL-encoded form body for non-POST mutating verbs */
 	private ?array $formBody = null;
 
 	private ?string $rawBodyOverride = null;
@@ -72,7 +73,7 @@ class Request extends Wire
 
 	public function isDemoMode(): bool
 	{
-		return (bool) ($this->wire()?->config?->demo ?? false);
+		return (bool) $this->wire()->config->demo;
 	}
 
 	/**
@@ -123,7 +124,10 @@ class Request extends Wire
 			$_SERVER['HTTP_X_HTTP_METHOD_OVERRIDE']
 		);
 		$_SERVER['REQUEST_METHOD'] = 'GET';
-		$this->wireInput()?->post->removeAll();
+		$input = $this->wireInput();
+		if ($input !== null) {
+			$input->post->removeAll();
+		}
 	}
 
 	/**
@@ -254,7 +258,7 @@ class Request extends Wire
 	public function wireInput(): ?WireInput
 	{
 		try {
-			$input = $this->wire()?->input;
+			$input = $this->wire()->input;
 
 			return $input instanceof WireInput ? $input : null;
 		} catch (Throwable $e) {
@@ -305,7 +309,7 @@ class Request extends Wire
 	public function uri(): string
 	{
 		$input = $this->wireInput();
-		if ($input !== null && method_exists($input, 'url')) {
+		if ($input !== null) {
 			try {
 				return (string) $input->url(true);
 			} catch (Throwable $e) {
@@ -396,7 +400,7 @@ class Request extends Wire
 		}
 
 		$input = $this->wireInput();
-		if ($input !== null && method_exists($input, 'requestMethod')) {
+		if ($input !== null) {
 			try {
 				$detectedMethod = strtoupper(trim((string) $input->requestMethod()));
 				if ($detectedMethod !== '') {
@@ -439,7 +443,7 @@ class Request extends Wire
 	 * Parse and return the decoded JSON request body as an associative array.
 	 * Returns an empty array when a state-mutating request is blocked by ProcessWire demo mode (`$config->demo = true`).
 	 *
-	 * @return array<string, mixed>
+	 * @return array<int|string, mixed>
 	 */
 	public function json(): array
 	{
@@ -454,7 +458,7 @@ class Request extends Wire
 	 * Decode bounded `application/x-www-form-urlencoded` request bodies sent via `php://input`
 	 * on non-`POST` mutating verbs (`PUT`, `PATCH`, `DELETE`) where PHP SAPI leaves `$_POST` empty.
 	 *
-	 * @return array<string, mixed>
+	 * @return array<int|string, mixed>
 	 */
 	private function decodeRawFormBody(): array
 	{
@@ -491,13 +495,13 @@ class Request extends Wire
 
 		$parsed = [];
 		parse_str($raw, $parsed);
-		$this->formBody = is_array($parsed) ? $this->sanitizeJsonTree($parsed) : [];
+		$this->formBody = self::sanitizeInputTree($parsed);
 
 		return $this->formBody;
 	}
 
 	/**
-	 * @return array<string, mixed>
+	 * @return array<int|string, mixed>
 	 */
 	private function decodeRawJson(): array
 	{
@@ -525,18 +529,18 @@ class Request extends Wire
 		}
 
 		$decoded = json_decode($raw, true, self::MAX_JSON_DEPTH);
-		$this->jsonBody = is_array($decoded) ? $this->sanitizeJsonTree($decoded) : [];
+		$this->jsonBody = is_array($decoded) ? self::sanitizeInputTree($decoded) : [];
 
 		return $this->jsonBody;
 	}
 
 	/**
-	 * Recursively strip blocked superglobal / prototype-pollution keys and control-character keys from decoded JSON.
+	 * Recursively strip blocked superglobal / prototype-pollution keys and control-character keys from decoded payloads.
 	 *
 	 * @param array<mixed, mixed> $data
 	 * @return array<string|int, mixed>
 	 */
-	private function sanitizeJsonTree(array $data, int $depth = 0): array
+	public static function sanitizeInputTree(array $data, int $depth = 0): array
 	{
 		if ($depth >= self::MAX_JSON_DEPTH) {
 			return [];
@@ -544,11 +548,11 @@ class Request extends Wire
 
 		$clean = [];
 		foreach ($data as $key => $value) {
-			if (is_string($key) && !$this->isSafeInputKey($key)) {
+			if (is_string($key) && !self::isSafeInputKey($key)) {
 				continue;
 			}
 			if (is_array($value)) {
-				$clean[$key] = $this->sanitizeJsonTree($value, $depth + 1);
+				$clean[$key] = self::sanitizeInputTree($value, $depth + 1);
 			} else {
 				$clean[$key] = $value;
 			}
@@ -558,10 +562,22 @@ class Request extends Wire
 	}
 
 	/**
+	 * Convert scalar or `Stringable` values into a `string`, returning `''` for arrays, objects, or `null`.
+	 */
+	public static function scalarString(mixed $value): string
+	{
+		if (is_scalar($value) || $value instanceof \Stringable) {
+			return (string) $value;
+		}
+
+		return '';
+	}
+
+	/**
 	 * Validate that an input key is non-empty, within length limits, free of control characters,
 	 * and not a reserved superglobal or prototype-pollution identifier.
 	 */
-	private function isSafeInputKey(string $key): bool
+	public static function isSafeInputKey(string $key): bool
 	{
 		if ($key === '' || strlen($key) > self::MAX_KEY_LENGTH) {
 			return false;
@@ -601,7 +617,7 @@ class Request extends Wire
 		}
 
 		foreach ($payload as $key => $value) {
-			if (!is_string($key) || !$this->isSafeInputKey($key)) {
+			if (!is_string($key) || !self::isSafeInputKey($key)) {
 				continue;
 			}
 			if ($post->get($key) === null) {
@@ -617,25 +633,18 @@ class Request extends Wire
 	 * `$this->wire()->input->post` under ProcessWire's active CSRF token name so native
 	 * `$session->CSRF->validate()` and `$session->CSRF->hasValidToken()` succeed on Inertia requests.
 	 */
-	public function syncCsrfToPost(bool $force = false): void
+	public function syncCsrfToPost(): void
 	{
-		if ($this->isDemoMode() || (!$force && !$this->isMutatingMethod())) {
+		if ($this->isDemoMode() || !$this->isMutatingMethod()) {
 			return;
 		}
 
-		if ($force && !$this->isMutatingMethod()) {
-			return;
-		}
-
-		$session = $this->wire()?->session;
-		if ($session === null) {
-			return;
-		}
+		$session = $this->wire()->session;
 
 		$csrf = $session->CSRF;
 		$tokenName = (string) $csrf->getTokenName();
 		$expectedValue = (string) $csrf->getTokenValue();
-		if ($tokenName === '' || $expectedValue === '' || !$this->isSafeInputKey($tokenName)) {
+		if ($tokenName === '' || $expectedValue === '' || !self::isSafeInputKey($tokenName)) {
 			return;
 		}
 
@@ -671,13 +680,26 @@ class Request extends Wire
 	}
 
 	/**
+	 * Synchronize inbound JSON / URL-encoded payloads and CSRF headers into `$input->post`
+	 * according to `$syncJson` (defaults to the active `Inertia::$syncJsonToPost` setting).
+	 */
+	public function syncInboundInput(?bool $syncJson = null): void
+	{
+		if ($syncJson ?? $this->shouldSyncJsonToPost()) {
+			$this->syncJsonToPost();
+		} else {
+			$this->syncCsrfToPost();
+		}
+	}
+
+	/**
 	 * Determine whether automatic JSON-to-`$input->post` synchronization is enabled on the `Inertia` module.
 	 */
 	private function shouldSyncJsonToPost(): bool
 	{
 		try {
-			$modules = $this->wire()?->modules;
-			if ($modules !== null && $modules->isInstalled('Inertia')) {
+			$modules = $this->wire()->modules;
+			if ($modules->isInstalled('Inertia')) {
 				$inertia = $modules->get('Inertia');
 				if (is_object($inertia) && method_exists($inertia, 'get')) {
 					return (bool) ($inertia->get('syncJsonToPost') ?? true);
@@ -722,7 +744,7 @@ class Request extends Wire
 		$normalizedKey = $key ?? '';
 		if ($normalizedKey !== '') {
 			$lookupKey = str_ends_with($normalizedKey, '[]') ? substr($normalizedKey, 0, -2) : $normalizedKey;
-			if (!$this->isSafeInputKey($lookupKey)) {
+			if (!self::isSafeInputKey($lookupKey)) {
 				return $fallback;
 			}
 		}
@@ -752,7 +774,7 @@ class Request extends Wire
 		$normalizedKey = $key ?? '';
 		if ($normalizedKey !== '') {
 			$lookupKey = str_ends_with($normalizedKey, '[]') ? substr($normalizedKey, 0, -2) : $normalizedKey;
-			if (!$this->isSafeInputKey($lookupKey)) {
+			if (!self::isSafeInputKey($lookupKey)) {
 				return $fallback;
 			}
 		}
@@ -769,11 +791,7 @@ class Request extends Wire
 		}
 
 		$syncEnabled = $this->shouldSyncJsonToPost();
-		if ($syncEnabled) {
-			$this->syncJsonToPost();
-		} else {
-			$this->syncCsrfToPost();
-		}
+		$this->syncInboundInput($syncEnabled);
 
 		if (!$syncEnabled && $normalizedKey !== '') {
 			$postArr = $this->postArray();
@@ -803,7 +821,7 @@ class Request extends Wire
 	/**
 	 * Return all GET parameters as a sanitized associative array via `WireInput::$get`.
 	 *
-	 * @return array<string, mixed>
+	 * @return array<int|string, mixed>
 	 */
 	public function getArray(): array
 	{
@@ -812,7 +830,7 @@ class Request extends Wire
 			try {
 				$arr = $input->get->getArray();
 
-				return is_array($arr) ? $this->sanitizeJsonTree($arr) : [];
+				return is_array($arr) ? self::sanitizeInputTree($arr) : [];
 			} catch (Throwable $e) {
 				$this->logRequestError('getArray', $e);
 
@@ -827,7 +845,7 @@ class Request extends Wire
 	 * Return all POST / JSON parameters as a sanitized associative array via `WireInput::$post`.
 	 * Returns an empty array when a state-mutating request is blocked by ProcessWire demo mode (`$config->demo = true`).
 	 *
-	 * @return array<string, mixed>
+	 * @return array<int|string, mixed>
 	 */
 	public function postArray(): array
 	{
@@ -835,18 +853,14 @@ class Request extends Wire
 			return [];
 		}
 
-		if ($this->shouldSyncJsonToPost()) {
-			$this->syncJsonToPost();
-		} else {
-			$this->syncCsrfToPost();
-		}
+		$this->syncInboundInput();
 
 		$input = $this->wireInput();
 		$post = [];
 		if ($input !== null && is_object($input->post) && method_exists($input->post, 'getArray')) {
 			try {
 				$arr = $input->post->getArray();
-				$post = is_array($arr) ? $this->sanitizeJsonTree($arr) : [];
+				$post = is_array($arr) ? self::sanitizeInputTree($arr) : [];
 			} catch (Throwable $e) {
 				$this->logRequestError('postArray', $e);
 				$post = [];
@@ -867,18 +881,18 @@ class Request extends Wire
 	 * When a state-mutating request is blocked by ProcessWire demo mode (`$config->demo = true`),
 	 * only read-only GET parameters are returned.
 	 *
-	 * @return array<string, mixed>
+	 * @return array<int|string, mixed>
 	 */
 	public function all(): array
 	{
 		$input = $this->wireInput();
-		$get = $input !== null ? $this->sanitizeJsonTree($input->get->getArray()) : [];
+		$get = $input !== null ? self::sanitizeInputTree($input->get->getArray()) : [];
 
 		if ($this->isDemoModeBlocked()) {
 			return $get;
 		}
 
-		$post = $input !== null ? $this->sanitizeJsonTree($input->post->getArray()) : [];
+		$post = $input !== null ? self::sanitizeInputTree($input->post->getArray()) : [];
 		$formPayload = $this->isUrlEncodedForm() ? $this->decodeRawFormBody() : [];
 
 		return array_replace($get, $post, $formPayload, $this->json());
@@ -917,7 +931,7 @@ class Request extends Wire
 			$cursor = $all;
 			$found = true;
 			foreach (explode('.', $lookupKey) as $segment) {
-				if ($segment === '' || !$this->isSafeInputKey($segment) || !is_array($cursor) || !array_key_exists($segment, $cursor)) {
+				if ($segment === '' || !self::isSafeInputKey($segment) || !is_array($cursor) || !array_key_exists($segment, $cursor)) {
 					$found = false;
 					break;
 				}
@@ -926,7 +940,7 @@ class Request extends Wire
 			if ($found) {
 				$value = $cursor;
 			}
-		} elseif (!$this->isSafeInputKey($lookupKey)) {
+		} elseif (!self::isSafeInputKey($lookupKey)) {
 			return $default;
 		}
 
@@ -998,10 +1012,7 @@ class Request extends Wire
 			return $default;
 		}
 
-		$pwSanitizer = $this->wire()?->sanitizer;
-		if ($pwSanitizer === null) {
-			return $default;
-		}
+		$pwSanitizer = $this->wire()->sanitizer;
 
 		$allSanitizers = $pwSanitizer->getAll(true);
 		$current = $value;
@@ -1057,7 +1068,7 @@ class Request extends Wire
 	 */
 	public function pageNumber(string $pageName = 'page'): int
 	{
-		$maxPageNum = max(1, (int) ($this->wire()?->config?->maxPageNum ?: 999));
+		$maxPageNum = max(1, (int) ($this->wire()->config->maxPageNum ?: 999));
 		$val = $this->input($pageName);
 		if (is_int($val)) {
 			return $val >= 1 ? min($val, $maxPageNum) : 1;
@@ -1077,8 +1088,8 @@ class Request extends Wire
 		}
 
 		$input = $this->wireInput();
-		if ($input !== null && method_exists($input, 'pageNum')) {
-			$pageNum = (int) $input->pageNum();
+		if ($input !== null) {
+			$pageNum = $input->pageNum();
 			if ($pageNum >= 1) {
 				return min($pageNum, $maxPageNum);
 			}
@@ -1110,19 +1121,19 @@ class Request extends Wire
 			return false;
 		}
 
-		$config = $this->wire()?->config;
-		if ($config !== null && isset($config->protectCSRF) && !(bool) $config->protectCSRF) {
+		$config = $this->wire()->config;
+		if (isset($config->protectCSRF) && !(bool) $config->protectCSRF) {
 			return true;
 		}
 
 		if ($this->shouldSyncJsonToPost()) {
 			$this->syncJsonToPost();
 		}
-		$this->syncCsrfToPost(true);
+		$this->syncCsrfToPost();
 
-		$session = $this->wire()?->session;
-		$csrf = $session !== null ? $session->CSRF : null;
-		if (!is_object($csrf) || !method_exists($csrf, 'hasValidToken')) {
+		$session = $this->wire()->session;
+		$csrf = $session->CSRF;
+		if (!$csrf instanceof SessionCSRF && (!is_object($csrf) || !method_exists($csrf, 'hasValidToken'))) {
 			if ($throwException) {
 				throw new WirePermissionException($this->_('Request security validation failed. Please refresh the page and try again.'));
 			}
@@ -1133,7 +1144,9 @@ class Request extends Wire
 		$valid = (bool) $csrf->hasValidToken('', false);
 
 		if (!$valid) {
-			$csrf->resetToken();
+			if ($csrf instanceof SessionCSRF || method_exists($csrf, 'resetToken')) {
+				$csrf->resetToken();
+			}
 			if ($throwException) {
 				throw new WirePermissionException($this->_('Request security validation failed. Please refresh the page and try again.'));
 			}
@@ -1170,12 +1183,9 @@ class Request extends Wire
 		}
 
 		if (function_exists('getallheaders')) {
-			$headers = @getallheaders();
-			if (is_array($headers)) {
-				foreach ($headers as $k => $_v) {
-					if (is_string($k) && (strcasecmp($k, $canonical) === 0 || strcasecmp($k, $name) === 0)) {
-						return true;
-					}
+			foreach (getallheaders() as $k => $_v) {
+				if (is_string($k) && (strcasecmp($k, $canonical) === 0 || strcasecmp($k, $name) === 0)) {
+					return true;
 				}
 			}
 		}
@@ -1228,14 +1238,11 @@ class Request extends Wire
 		}
 
 		if (function_exists('getallheaders')) {
-			$headers = @getallheaders();
-			if (is_array($headers)) {
-				foreach ($headers as $k => $v) {
-					if (is_string($k) && (strcasecmp($k, $canonical) === 0 || strcasecmp($k, $name) === 0) && is_scalar($v)) {
-						$str = trim((string) $v);
+			foreach (getallheaders() as $k => $v) {
+				if (is_string($k) && (strcasecmp($k, $canonical) === 0 || strcasecmp($k, $name) === 0) && is_scalar($v)) {
+					$str = trim((string) $v);
 
-						return $str !== '' ? $str : $default;
-					}
+					return $str !== '' ? $str : $default;
 				}
 			}
 		}
@@ -1352,7 +1359,7 @@ class Request extends Wire
 	private function logRequestError(string $context, Throwable $e): void
 	{
 		try {
-			$this->wire()?->log?->error("Inertia Request {$context} failed: " . $e->getMessage());
+			$this->wire()->log->error("Inertia Request {$context} failed: " . $e->getMessage());
 		} catch (Throwable) {
 			// Guard against recursive logging errors when filesystem log is unwritable
 		}

@@ -12,14 +12,13 @@ use ProcessWire\Inertia;
 use ProcessWire\Page;
 use ProcessWire\Process;
 use ProcessWire\ProcessController;
+use ProcessWire\User;
 use ProcessWire\Wire;
 use ProcessWire\Wire404Exception;
 use ProcessWire\WireCSRFException;
 use ProcessWire\WirePermissionException;
 use Totoglu\Inertia\PageResponse;
 use Totoglu\Inertia\Response;
-
-use function ProcessWire\__;
 
 /**
  * Executes Inertia-enabled Admin `Process` modules during `Page::render` (`template=admin`),
@@ -46,16 +45,12 @@ final class AdminProcessExecutor extends Wire
 		Closure $resolveOutput,
 		string $defaultCsrfErrorMessage
 	): void {
-		$wire = $event->wire() ?? $this->wire() ?? $this->module->wire();
+		$wire = $event->wire();
 		$request = $this->module->request;
 		$response = $this->module->response;
 
 		$response->setHeader('X-Frame-Options', 'SAMEORIGIN');
-		if ($this->module->syncJsonToPost) {
-			$request->syncJsonToPost();
-		} else {
-			$request->syncCsrfToPost();
-		}
+		$request->syncInboundInput((bool) $this->module->syncJsonToPost);
 		$this->module->enforceDemoModeGuard();
 
 		// Allow classic AdminThemeUikit flyout navigation requests (`navJSON`) to run through standard admin.php
@@ -73,7 +68,7 @@ final class AdminProcessExecutor extends Wire
 
 		if ($wire->user->isGuest()) {
 			if ($request->isInertia()) {
-				$adminUrl = (string) ($wire->config->urls->admin ?: ($wire->config->urls->get('admin') ?: '/processwire/'));
+				$adminUrl = Inertia::resolveAdminUrl($wire->config);
 				$this->module->location(rtrim($adminUrl, '/') . '/login/');
 				$response->applyHeaders();
 				$event->replace = true;
@@ -88,7 +83,12 @@ final class AdminProcessExecutor extends Wire
 		}
 
 		$prevOutputFormatting = $wire->pages->of();
+		$prevPage = $wire->page;
+		$didRebindPage = !$prevPage instanceof Page || $prevPage !== $page;
 		$wire->pages->of(false);
+		if ($didRebindPage) {
+			$wire->wire('page', $page);
+		}
 
 		try {
 			if (!$wire->breadcrumbs instanceof Breadcrumbs) {
@@ -145,17 +145,11 @@ final class AdminProcessExecutor extends Wire
 					}
 				}
 
-				$prevEntityEncode = function_exists('ProcessWire\\__') ? __(true, 'entityEncode', false) : null;
-				try {
-					$content = $controller->execute();
-				} finally {
-					if (function_exists('ProcessWire\\__')) {
-						__(true, 'entityEncode', $prevEntityEncode ?? 1);
-					}
-				}
+				$content = Inertia::withoutEntityEncoding(static fn(): mixed => $controller->execute());
 			} catch (WireCSRFException $csrfEx) {
-				$adminUrl = (string) ($wire->config->urls->admin ?: ($wire->config->urls->get('admin') ?: '/processwire/'));
-				if ($wire->user->isGuest()) {
+				$adminUrl = Inertia::resolveAdminUrl($wire->config);
+				$activeUser = $wire->user;
+				if ($activeUser instanceof User && $activeUser->isGuest()) {
 					if ($request->isInertia()) {
 						$this->module->location(rtrim($adminUrl, '/') . '/login/');
 						$response->applyHeaders();
@@ -170,6 +164,7 @@ final class AdminProcessExecutor extends Wire
 					? $csrfEx->getMessage()
 					: $defaultCsrfErrorMessage;
 				$wire->error($csrfMessage);
+				$wire->session->error($csrfMessage);
 
 				$referer = $request->header('Referer');
 				$fallbackTarget = (string) ($wire->input->url(true) ?: ($page->url ?: $adminUrl));
@@ -178,6 +173,7 @@ final class AdminProcessExecutor extends Wire
 				if ($request->isInertia()) {
 					$this->module->location($backTarget);
 				} else {
+					$this->module->ensureXsrfCookie();
 					$response->setStatusCode(303);
 					$response->setHeader('Location', $response->sanitizeNavigationUrl($backTarget));
 				}
@@ -188,12 +184,14 @@ final class AdminProcessExecutor extends Wire
 				return;
 			} catch (WirePermissionException $permEx) {
 				if ($request->isInertia()) {
-					$adminUrl = (string) ($wire->config->urls->admin ?: ($wire->config->urls->get('admin') ?: '/processwire/'));
-					if ($wire->user->isGuest()) {
+					$adminUrl = Inertia::resolveAdminUrl($wire->config);
+					$activeUser = $wire->user;
+					if ($activeUser instanceof User && $activeUser->isGuest()) {
 						$this->module->location(rtrim($adminUrl, '/') . '/login/');
 					} else {
 						if ($permEx->getMessage() !== '') {
 							$wire->error($permEx->getMessage());
+							$wire->session->error($permEx->getMessage());
 						}
 						$this->module->location($adminUrl);
 					}
@@ -237,13 +235,17 @@ final class AdminProcessExecutor extends Wire
 			}
 
 			if (is_string($content)) {
-				if ($this->isJsonString($content) && !headers_sent() && PHP_SAPI !== 'cli') {
-					header('Content-Type: application/json; charset=utf-8');
+				if ($this->isJsonString($content) && $response->getHeader('Content-Type') === null) {
+					$response->setHeader('Content-Type', 'application/json; charset=utf-8');
 				}
+				$response->applyHeaders();
 				$event->replace = true;
 				$event->return = $content;
 			}
 		} finally {
+			if ($didRebindPage && $prevPage instanceof Page) {
+				$wire->wire('page', $prevPage);
+			}
 			$wire->pages->of($prevOutputFormatting);
 		}
 	}

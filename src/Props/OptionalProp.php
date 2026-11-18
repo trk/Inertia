@@ -6,6 +6,7 @@ namespace Totoglu\Inertia\Props;
 
 use Closure;
 use Totoglu\Inertia\Request;
+use Totoglu\Inertia\Support\PropResolver;
 
 /**
  * Prop wrapper excluded from standard visits and evaluated only when explicitly
@@ -24,6 +25,6 @@ final class OptionalProp implements PropInterface
 
 	public function __invoke(?Request $request = null): mixed
 	{
-		return ($this->callback)();
+		return PropResolver::invokeCallback($this->callback, $request);
 	}
 }
