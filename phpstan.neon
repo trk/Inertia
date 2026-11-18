@@ -1,0 +1,21 @@
+parameters:
+	level: 8
+	phpVersion: 80400
+	bootstrapFiles:
+		- tests/phpstan-bootstrap.php
+	scanFiles:
+		- ../../../wire/modules/Fieldtype/FieldtypeRepeater/RepeaterPage.php
+		- ../../../wire/modules/Fieldtype/FieldtypeOptions/SelectableOption.php
+		- ../../../wire/modules/Fieldtype/FieldtypeOptions/SelectableOptionArray.php
+		- ../../../wire/modules/Fieldtype/FieldtypeOptions/SelectableOptionManager.php
+	paths:
+		- Inertia.module.php
+		- functions.php
+		- src
+		- commands
+	treatPhpDocTypesAsCertain: false
+	ignoreErrors:
+		# Public library extension trait provided for custom Fieldtype modules implementing InertiaFieldtypeInterface
+		-
+			identifier: trait.unused
+			path: src/InteractWithInertiaFieldtype.php

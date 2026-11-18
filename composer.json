@@ -25,13 +25,12 @@
 		"psr-4": {
 			"Totoglu\\Inertia\\": "src/",
 			"Totoglu\\Inertia\\Commands\\": "commands/"
-		}
+		},
+		"files": [
+			"functions.php"
+		]
 	},
 	"extra": {
-		"commands": [
-			"Totoglu\\Inertia\\Commands\\InertiaTypesCommand",
-			"Totoglu\\Inertia\\Commands\\InertiaInstallCommand"
-		],
 		"processwire-console": {
 			"commands": [
 				"Totoglu\\Inertia\\Commands\\InertiaTypesCommand",
@@ -45,9 +44,11 @@
 	},
 	"config": {
 		"process-timeout": 0,
+		"sort-packages": true,
 		"allow-plugins": {
 			"hari/pw-module": true
 		}
 	},
-	"minimum-stability": "dev"
+	"minimum-stability": "dev",
+	"prefer-stable": true
 }
