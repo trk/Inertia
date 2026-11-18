@@ -24,7 +24,7 @@ ProcessWire defaults to a server-rendered template lifecycle (`_init.php` → `{
    - During `Inertia::doBuildPageObject()`, props merge in strict precedence:
      `baselineProps` (`errors`, `flash`, `csrf`) → `$inertia->sharedProps` → `$page->inertiaShared()` → `$process->inertiaShared()` → nested `InertiaSerializable::inertiaShared()` → `$page->inertiaWithData()` → `$process->inertiaWithData()` → `$pageResponse->rawProps()`.
    - During `Inertia::renderRootView()`, Root View variables merge via `PropResolver::mergeViewData()`:
-     `$inertia->sharedViewData` → `$page->inertiaViewData($pageObject)` → `$page->inertiaWithViewData($pageObject)` → `$process->inertiaViewData($pageObject)` → `$process->inertiaWithViewData($pageObject)` → `$pageResponse->viewData()`.
+     `$inertia->sharedViewData` → `$page->inertiaViewData($pageObject)` → `$page->inertiaWithViewData($pageObject)` → `$process->inertiaViewData($pageObject)` → `$process->inertiaWithViewData($pageObject)` → `$pageResponse->getViewData()`.
    - `ProcessInertia`, `MarkupInertia`, and `InputfieldInertia` extend native ProcessWire module classes (`Process`, `ModuleJS`, `Inputfield`) with `InteractWithInertia` (and `InertiaSerializable` on `MarkupInertia` / `InputfieldInertia`) so admin modules, UI islands, and form fields work identically in both classic and full-page Inertia contexts.
 
 3. **Inertia v3 Prop Engine (`PropResolver`):**

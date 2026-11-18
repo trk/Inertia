@@ -1,5 +1,5 @@
 ---
-description: "Use when working with Totoglu\\Inertia (ProcessWire\\Inertia), structuring Custom Page Classes with InteractWithInertia (DefaultPage + [PascalCase]Page + $page->inertiaRender()), rendering Inertia.js v3 SPA components, extending ProcessInertia, MarkupInertia, or InputfieldInertia, implementing InertiaFieldtypeInterface or InertiaSerializable, creating DataProviders in site/inertia/*Provider.php or hooking Inertia::registerProviders, using DeferredProp, MergeProp, OnceProp, ScrollProp, OptionalProp, or AlwaysProp, or running wire inertia:types and wire inertia:install."
+description: "Use when working with Totoglu\\Inertia (ProcessWire\\Inertia), structuring Custom Page Classes with InteractWithInertia, extending ProcessInertia, MarkupInertia, or InputfieldInertia, implementing InertiaFieldtypeInterface or InertiaSerializable, registering DataProviders in site/inertia/*Provider.php, using Inertia v3 prop wrappers, or running wire inertia:types and wire inertia:install."
 ---
 
 # AI Agent Guidelines for `ProcessWire\Inertia` (`Totoglu\Inertia`)
@@ -26,7 +26,7 @@ description: "Use when working with Totoglu\\Inertia (ProcessWire\\Inertia), str
 
 3. **3-Tier DataProvider Pipeline (`Totoglu\Inertia\Provider\ProviderRegistry`):**
    - Runtime serialization of `Page`, `Field`, and `User` objects and static generation of `site/classes/*Page.php` + `inertia.d.ts` run through `ProviderRegistry` using "Replace, Don't Layer" precedence:
-     - **Tier 1 (Core):** `FieldtypeFieldDataProvider` (delegates to `Fieldtype` modules implementing `InertiaFieldtypeInterface`), `ScalarFieldDataProvider`, `MediaFieldDataProvider`, `PageReferenceFieldDataProvider`, `RepeaterFieldDataProvider`, `OptionsFieldDataProvider`, `TemplateDataProvider`, `UserDataProvider`.
+     - **Tier 1 (Core):** Built-in `InertiaFieldtypeInterface` bridge adapter, `ScalarFieldDataProvider`, `MediaFieldDataProvider`, `PageReferenceFieldDataProvider`, `RepeaterFieldDataProvider`, `OptionsFieldDataProvider`, `TemplateDataProvider`, `UserDataProvider`.
      - **Tier 2 (Module Hooks):** `Inertia::registerProviders` hook calling `$inertia->registerProvider(...)`.
      - **Tier 3 (Project Auto-Discovery):** `site/inertia/*Provider.php` under `namespace Totoglu\Inertia\Provider;`.
    - Keep Custom Page Classes free of `toInertiaProp()` DTO arrays; use `TemplateDataProvider::extraData(Page $page)` and `extraTsTypes(Template $template)` in `site/inertia/*TemplateDataProvider.php` when extending serialized `Page` payloads.
@@ -38,8 +38,8 @@ description: "Use when working with Totoglu\\Inertia (ProcessWire\\Inertia), str
 5. **Extendable Module Base Classes:**
    - **`ProcessInertia` (`Totoglu\Inertia\ProcessInertia`):** Admin `Process` base class using `InteractWithInertia` with full-page admin mode (`inertiaFullPageAdmin(): true`).
    - **`MarkupInertia` (`Totoglu\Inertia\MarkupInertia`):** `ModuleJS` base class implementing `InertiaSerializable` and `InteractWithInertia` for `<div class="pw-inertia-island">` rendering and prop composition.
-   - **`InputfieldInertia` (`Totoglu\Inertia\InputfieldInertia`):** `Inputfield` base class implementing `InertiaSerializable` and `InteractWithInertia` for classic admin forms (`data-inertia-input="true"`) and full-page Inertia `InputfieldWrapper` prop trees.
+   - **`InputfieldInertia` (`Totoglu\Inertia\InputfieldInertia`):** `Inputfield` base class implementing `InertiaSerializable` and `InteractWithInertia` for classic admin forms (`data-inertia-input="{name}"`) and full-page Inertia `InputfieldWrapper` prop trees.
 
 6. **Translations & Verification:**
    - Chronological ProcessWire `LanguagePorter` CSV packs live in `languages/{en,tr,de,es,fr,ru}.csv` (`default,en,...` for `en.csv` and `en,{locale},...` for others).
-   - Verify changes with `php vendor/bin/wire test site/modules/Inertia/tests/Unit/InertiaTest.php`.
+   - Verify static analysis and tests with `./vendor/bin/phpstan analyse -c site/modules/Inertia/phpstan.neon --no-progress --memory-limit=1G`, `php vendor/bin/wire test site/modules/Inertia/tests --json`, and `php vendor/bin/wire test:e2e --module=Inertia --json`.

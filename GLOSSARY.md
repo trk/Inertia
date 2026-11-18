@@ -39,7 +39,7 @@ The abstract markup module base class (`Totoglu\Inertia\MarkupInertia extends Pr
 _Avoid_: Partial view, widget helper
 
 **InputfieldInertia**:
-The abstract inputfield base class (`Totoglu\Inertia\InputfieldInertia extends ProcessWire\Inputfield implements InertiaSerializable`) using `InteractWithInertia` to render synchronized `<input type="hidden" data-inertia-input="true">` island mounts in classic forms and serialize into `InputfieldWrapper` prop trees on full-page Inertia responses.
+The abstract inputfield base class (`Totoglu\Inertia\InputfieldInertia extends ProcessWire\Inputfield implements InertiaSerializable`) using `InteractWithInertia` to render synchronized `<input type="hidden" data-inertia-input="{name}">` island mounts in classic forms and serialize into `InputfieldWrapper` prop trees on full-page Inertia responses.
 _Avoid_: Form widget
 
 ## Props & Evaluation
@@ -95,11 +95,11 @@ The provider (`Totoglu\Inertia\Provider\UserDataProvider`) that serializes `Proc
 _Avoid_: Auth model
 
 **InertiaFieldtypeInterface**:
-The contract (`Totoglu\Inertia\Contracts\InertiaFieldtypeInterface` + `Totoglu\Inertia\InteractWithInertiaFieldtype`) implemented directly by custom `Fieldtype` modules so `FieldtypeFieldDataProvider` delegates runtime serialization and static type generation to the `Fieldtype`.
+The contract (`Totoglu\Inertia\Contracts\InertiaFieldtypeInterface` + `Totoglu\Inertia\InteractWithInertiaFieldtype`) implemented directly by custom `Fieldtype` modules so `ProviderRegistry`'s built-in `InertiaFieldtypeInterface` bridge adapter delegates runtime serialization and static type generation to the `Fieldtype`.
 _Avoid_: Custom field helper
 
 **InertiaSerializable**:
-The contract (`Totoglu\Inertia\Contracts\InertiaSerializable`) for objects (`MarkupInertia`, `InputfieldInertia`, or custom domain objects) that define an explicit `toInertiaProp(): array` payload.
+The contract (`Totoglu\Inertia\Contracts\InertiaSerializable`) for objects (`MarkupInertia`, `InputfieldInertia`, or custom domain objects) that define an explicit `toInertiaProp(): mixed` payload.
 _Avoid_: JsonSerializable, Arrayable
 
 **SSR Gateway**:

@@ -6,15 +6,17 @@ Build Vue 3, React, or Svelte applications on top of ProcessWire's native routin
 
 ---
 
-## Requirements & Installation
+## Requirements
 
 - **PHP:** `>= 8.4`
 - **ProcessWire:** `>= 3.0.271`
 - **Required Module:** `Vite` (`trk/processwire-vite`)
 
+## Installation
+
 ```bash
 composer require trk/processwire-inertia
-php vendor/bin/wire module:install Inertia --json
+php vendor/bin/wire module:install --name=Inertia --json
 ```
 
 To scaffold the Root View (`site/templates/_inertia.php`), Vite entry (`site/templates/assets/js/inertia.ts`), starter component, Custom Page Class, and TypeScript definitions (`inertia.d.ts`):
@@ -23,9 +25,35 @@ To scaffold the Root View (`site/templates/_inertia.php`), Vite entry (`site/tem
 php vendor/bin/wire inertia:install --stack=vue --template=home --json
 ```
 
----
+## Quick Start
 
-## 1. Template Lifecycle & Activation Modes
+Enable Inertia on target templates in `site/ready.php` and return `$page->inertiaRender()` from your template controller:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace ProcessWire;
+
+// site/ready.php:
+/** @var ProcessWire $wire */
+$wire->inertia->forTemplates(['home', 'article']);
+```
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace ProcessWire;
+
+// site/templates/article.php:
+/** @var ArticlePage $page */
+return $page->inertiaRender('Articles/Show');
+```
+
+### 1. Template Lifecycle & Activation Modes
 
 In a classic ProcessWire site (`site/config.php`), requests run `_init.php` → `{template}.php` → `_main.php` (with Markup Regions).
 
@@ -35,7 +63,7 @@ Inertia replaces server-side layout merging (`_main.php`) with two response mode
 
 For every Inertia-enabled template, the module sets `$template->noAppendTemplateFile = true` at runtime so `_main.php` is skipped without mutating `$config->useMarkupRegions`.
 
-### Hybrid Mode (Mix Classic & Inertia Templates)
+#### Hybrid Mode (Mix Classic & Inertia Templates)
 Keep your existing `site/config.php` untouched for classic templates and enable Inertia only on selected templates:
 
 ```php
@@ -49,7 +77,7 @@ namespace ProcessWire;
 inertia()->forTemplates(['home', 'articles', 'article']);
 ```
 
-### Full SPA Mode (All Frontend Templates)
+#### Full SPA Mode (All Frontend Templates)
 When every frontend template renders through Inertia:
 
 ```php
@@ -67,13 +95,11 @@ $config->appendTemplateFile = '';
 inertia()->forAllTemplates();
 ```
 
----
-
-## 2. Custom Page Class Architecture (`InteractWithInertia`)
+### 2. Custom Page Class Architecture (`InteractWithInertia`)
 
 Enabling `$config->usePageClasses = true` in `site/config.php` lets you place domain queries, default props (`inertiaWithData()`), shared props (`inertiaShared()`), and Root View metadata (`inertiaViewData()`) directly on your Custom Page Classes in `site/classes/`, keeping `site/templates/{template}.php` controllers to a single line.
 
-### Step 1: Base `DefaultPage` (`site/classes/DefaultPage.php`)
+#### Step 1: Base `DefaultPage` (`site/classes/DefaultPage.php`)
 
 Create a base page class using `Totoglu\Inertia\InteractWithInertia` to centralize `<html lang>`, `<title>`, `<meta>` tags, and the base `'page' => $this` prop:
 
@@ -166,7 +192,7 @@ class DefaultPage extends Page
 }
 ```
 
-### Step 2: Template Page Class (`site/classes/ArticlePage.php`)
+#### Step 2: Template Page Class (`site/classes/ArticlePage.php`)
 
 Extend `DefaultPage` for each template to encapsulate ProcessWire selector queries and template-specific props:
 
@@ -197,6 +223,7 @@ class ArticlePage extends DefaultPage
 	 */
 	public function relatedArticles(int $limit = 4): array
 	{
+		$limit = max(1, $limit);
 		$providers = $this->inertia()->providers();
 		$items = [];
 
@@ -222,7 +249,7 @@ class ArticlePage extends DefaultPage
 }
 ```
 
-### Step 3: Thin Template Controller (`site/templates/article.php`)
+#### Step 3: Thin Template Controller (`site/templates/article.php`)
 
 In the template file, call `$page->inertiaRender()` to bind `$page` and render the frontend component:
 
@@ -239,9 +266,7 @@ return $page->inertiaRender('Articles/Show');
 
 Any extra props passed to `$page->inertiaRender('Articles/Show', ['extra' => 123])` (or pre-attached via `$page->with('extra', 123)`) are merged on top of `inertiaWithData()`.
 
----
-
-## 3. Root View (`site/templates/_inertia.php`)
+### 3. Root View (`site/templates/_inertia.php`)
 
 `_inertia.php` renders only on initial full-page loads. It receives `$inertia`, `$pageObject`, `$locale`, `$head` (automatically combining SSR `<head>` output with `inertiaViewData()['head']`), and any custom variables registered via `viewData()`:
 
@@ -285,11 +310,9 @@ if (!defined('PROCESSWIRE')) {
 </html>
 ```
 
----
+### 4. Shared State & Inertia v3 Prop Types
 
-## 4. Shared State & Inertia v3 Prop Types
-
-### Global Shared Props (`site/templates/_init.php` or `site/ready.php`)
+#### Global Shared Props (`site/templates/_init.php` or `site/ready.php`)
 
 Use `$inertia->shareOnce()` for cross-navigation cached datasets (navigation trees, directory counts, filter presets) and `$inertia->share()` for request-scoped state:
 
@@ -308,7 +331,7 @@ $page = $wire->page;
 
 $inertia->shareOnce('navigation', function () use ($pages): array {
 	$items = [];
-	foreach ($pages->get('/')->children() as $item) {
+	foreach ($pages->get('/')->children('limit=50') as $item) {
 		$items[] = [
 			'title' => (string) $item->title,
 			'url' => (string) $item->url,
@@ -324,7 +347,7 @@ $inertia->share([
 ]);
 ```
 
-### Lazy, Deferred, Merge, Once & Infinite Scroll Props
+#### Lazy, Deferred, Merge, Once & Infinite Scroll Props
 
 ```php
 <?php
@@ -358,17 +381,15 @@ return $inertia->render('Articles/Index', [
 
 When `->until()` is omitted on an `OnceProp`, `Inertia` inherits `$page->template->cache_time` and invalidates `WireCache` automatically on `Pages::saved`, `Pages::trashed`, and `Pages::deleted` according to `$template->cacheExpire`.
 
----
-
-## 5. 3-Tier DataProvider Pipeline (`site/inertia/`)
+### 5. 3-Tier DataProvider Pipeline (`site/inertia/`)
 
 Serialization of `Page`, `Field`, and `User` objects at runtime and static generation of `site/classes/*Page.php` + `inertia.d.ts` are managed by `Totoglu\Inertia\Provider\ProviderRegistry`:
 
-1. **Tier 1 (Built-in Core Providers):** `ScalarFieldDataProvider`, `MediaFieldDataProvider` (serializing `Pageimage` with `focus: { top, left, zoom }` and automatically enriching with `srcset`, `sizes`, `sources`, `lqip`, `dominantColor`, `palette`, `colorTheme`, and `imageHash` when [`trk/processwire-intervention-image`](https://github.com/trk/InterventionImage) is installed), `PageReferenceFieldDataProvider`, `RepeaterFieldDataProvider`, `OptionsFieldDataProvider`, `FieldtypeFieldDataProvider` (for `Fieldtype` modules implementing `InertiaFieldtypeInterface`), `TemplateDataProvider`, and `UserDataProvider`.
+1. **Tier 1 (Built-in Core Providers):** `ScalarFieldDataProvider`, `MediaFieldDataProvider` (serializing `Pageimage` with `focus: { top, left, zoom }` and `Pagefile` metadata alongside `InertiaImage`, `InertiaImageFocus`, and `InertiaFile` TypeScript interfaces), `PageReferenceFieldDataProvider`, `RepeaterFieldDataProvider`, `OptionsFieldDataProvider`, built-in `InertiaFieldtypeInterface` bridge adapter (for `Fieldtype` modules implementing `InertiaFieldtypeInterface`), `TemplateDataProvider`, and `UserDataProvider`.
 2. **Tier 2 (Module Hook):** Third-party modules hook `Inertia::registerProviders` and call `$inertia->registerProvider(...)`.
 3. **Tier 3 (Project Auto-Discovery in `site/inertia/*Provider.php`):** Files in `site/inertia/` under `namespace Totoglu\Inertia\Provider;` are discovered automatically and override lower tiers.
 
-### Example: Custom `TemplateDataProvider` (`site/inertia/ArticleTemplateDataProvider.php`)
+#### Example: Custom `TemplateDataProvider` (`site/inertia/ArticleTemplateDataProvider.php`)
 
 ```php
 <?php
@@ -422,7 +443,7 @@ final class ArticleTemplateDataProvider extends TemplateDataProvider
 }
 ```
 
-### Example: Custom `FieldDataProvider` (`site/inertia/MapMarkerFieldDataProvider.php`)
+#### Example: Custom `FieldDataProvider` (`site/inertia/MapMarkerFieldDataProvider.php`)
 
 ```php
 <?php
@@ -494,18 +515,15 @@ TS,
 }
 ```
 
----
-
-## 6. Extendable Module Base Classes & Fieldtype Contract
+### 6. Extendable Module Base Classes & Fieldtype Contract
 
 - **`Totoglu\Inertia\ProcessInertia`:** Abstract `Process` base class using `InteractWithInertia` for building full-page or embedded Inertia admin modules (`return (string) $this->inertiaRender('Admin/Dashboard', [...]);`).
 - **`Totoglu\Inertia\MarkupInertia`:** Abstract `ModuleJS` base class implementing `InertiaSerializable` and `InteractWithInertia`. Renders `<div class="pw-inertia-island" data-inertia-island="..." data-props="..."></div>` in classic templates or serializes as `{ component, props }` when passed as a prop into a parent Inertia response.
-- **`Totoglu\Inertia\InputfieldInertia`:** Abstract `Inputfield` base class implementing `InertiaSerializable` and `InteractWithInertia`. Renders a synchronized hidden `<input data-inertia-input="true">` and island mount node inside classic ProcessWire forms (`ProcessPageEdit`, `ProcessModule`), and serializes cleanly when an `InputfieldWrapper` is passed into a full-page Inertia response.
+- **`Totoglu\Inertia\InputfieldInertia`:** Abstract `Inputfield` base class implementing `InertiaSerializable` and `InteractWithInertia`. Renders a synchronized hidden `<input data-inertia-input="{name}">` and island mount node inside classic ProcessWire forms (`ProcessPageEdit`, `ProcessModule`), emits `XSRF-TOKEN` via `$inertia->ensureXsrfCookie()`, and serializes cleanly when an `InputfieldWrapper` is passed into a full-page Inertia response.
 - **`Totoglu\Inertia\Contracts\InertiaFieldtypeInterface` & `InteractWithInertiaFieldtype`:** Implement on custom `Fieldtype` modules to define `toInertiaFieldValue()`, `toInertiaPhpType()`, `toInertiaTsType()`, and `toInertiaTsDefinitions()` directly on the Fieldtype class.
+- **`ScalarFieldDataProvider` Inputfield Opt-In Constants:** Concrete `Inputfield` subclasses attached to `FieldtypeText` / `FieldtypeTextarea` fields can declare `INERTIA_IS_MARKUP_FIELD = true` (retain HTML textformatters), `INERTIA_IS_KEYVALUE_FIELD = true` (`stdClass` / `Record<string, string | number | boolean>`), `INERTIA_IS_LINK_FIELD = true` (`?array` / `Record<string, unknown> | null`), or `INERTIA_IS_ICON_FIELD = true` (`?array` / `Record<string, unknown> | null`).
 
----
-
-## 7. Forms, Validation, Flash & Redirects
+### 7. Forms, Validation, Flash & Redirects
 
 `Inertia` automatically populates `$input->post` from `application/json` request bodies (`syncJsonToPost`), validates ProcessWire CSRF / `X-XSRF-TOKEN` headers, flashes validation errors to `props.errors`, exposes top-level `page.flash` alongside `props.flash`, and downgrades post-mutation redirects to `303 See Other`:
 
@@ -538,7 +556,7 @@ $wire->addHook('/contact/submit', function (HookEvent $e): mixed {
 
 ---
 
-## 8. Configuration & CLI Commands
+## Configuration
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
@@ -560,16 +578,43 @@ $wire->addHook('/contact/submit', function (HookEvent $e): mixed {
 | `autoScaffoldPageClasses` | `bool` | `true` | Scaffolds missing `site/classes/[PascalCase]Page.php` classes (never overwrites existing files). |
 | `typeScriptOutputPath` | `string` | `'assets/js/types/inertia.d.ts'` | Output path for `inertia.d.ts` relative to `site/templates/`. |
 
-### CLI Commands (`vendor/bin/wire`)
+---
 
-| Command | Options | Description |
+## Hooks & Events
+
+| Hookable Method | Signature | Description |
 |---|---|---|
-| `php vendor/bin/wire inertia:install` | `--stack=vue\|react\|svelte`, `--template=<name>`, `--force`, `--json` | Publishes `_inertia.php`, `assets/js/inertia.ts`, starter component, Custom Page Class, template controller, and `inertia.d.ts`. |
-| `php vendor/bin/wire inertia:types` | `--template=<name>`, `--output=<path>`, `--ts-only`, `--php-only`, `--controllers`, `--force`, `--json` | Generates `site/classes/*Page.php` and `site/templates/assets/js/types/inertia.d.ts` from enabled templates and registered DataProviders. |
+| `Inertia::registerProviders` | `___registerProviders(): void` | Invoked when `ProviderRegistry` boots (Tier 2 module provider registration). |
+| `Inertia::buildPageObject` | `___buildPageObject(PageResponse $pageResponse): array` | Compiles a `PageResponse` into the Inertia v3 Page Object array. |
+| `Inertia::renderPageResponse` | `___renderPageResponse(PageResponse $pageResponse): string` | Renders a `PageResponse` into `X-Inertia: true` JSON or the Root View HTML shell. |
+| `Inertia::uninstall` | `___uninstall(): void` | Purges `WireCache` (`inertia-once`) and `Session` (`inertia`) namespaces on module uninstall. |
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace ProcessWire;
+
+$wire->addHookAfter('Inertia::registerProviders', function (HookEvent $event): void {
+	/** @var Inertia $inertia */
+	$inertia = $event->object;
+	$inertia->registerProvider(new CustomFieldDataProvider());
+});
+```
 
 ---
 
-## 9. Multi-Language Support & Security
+## CLI Commands (`vendor/bin/wire`)
+
+| Command | Options | Description |
+|---|---|---|
+| `php vendor/bin/wire inertia:install` | `--stack=vue\|react\|svelte`, `--template=<name>`, `--dry-run`, `--force`, `--json` | Publishes `_inertia.php`, `assets/js/inertia.ts`, starter component, Custom Page Class, template controller, and `inertia.d.ts`. |
+| `php vendor/bin/wire inertia:types` | `--template=<name>`, `--output=<path>`, `--ts-only`, `--php-only`, `--controllers`, `--dry-run`, `--force`, `--json` | Generates `site/classes/*Page.php` and `site/templates/assets/js/types/inertia.d.ts` from enabled templates and registered DataProviders. |
+
+---
+
+## Security & Permissions
 
 - **Translations:** Ships with chronological ProcessWire `LanguagePorter` CSV packs in `languages/{en,tr,de,es,fr,ru}.csv`. Import via **Setup → Languages** or `$language->porter->importCsv()`.
 - **CSRF Verification:** Validates `$session->CSRF` tokens via `$input->post`, `X-CSRF-TOKEN`, and `X-XSRF-TOKEN` headers (`$inertia->request->validateCsrf(true)`), and automatically bridges verified `X-XSRF-TOKEN` / `X-CSRF-TOKEN` / `_token` values into `$input->post` so native `$session->CSRF->validate()` succeeds.
