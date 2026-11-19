@@ -371,7 +371,6 @@ TS;
 
 		if ($stack === 'react') {
 			return <<<TSX
-import React from "react";
 import { Head, Link, Deferred } from "@inertiajs/react";
 import type { InertiaPageProps, {$interfaceName} } from "../../types/inertia";
 
