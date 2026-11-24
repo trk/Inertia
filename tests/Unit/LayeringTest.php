@@ -9,7 +9,7 @@ namespace Totoglu\Inertia\Tests\Unit;
  *
  * Verifies that Inertia remains a standalone presentation layer depending only
  * on ProcessWire core and Vite, with zero hardcoded coupling to sibling modules
- * (Htmx, InterventionImage, WireEntries, ProcessReactWorkspace, etc.).
+ * (Htmx, InterventionImage, Entries, ProcessReactWorkspace, etc.).
  */
 final class LayeringScanner
 {
@@ -179,11 +179,11 @@ final class LayeringScanner
 			'Htmx',
 			'InterventionImage',
 			'ProcessReactWorkspace',
-			'WireEntries',
-			'WireForms',
-			'WireHeadless',
-			'WireNavigation',
-			'WireSeo',
+			'Entries',
+			'Forms',
+			'Headless',
+			'Navigation',
+			'Seo',
 		];
 		foreach (glob(dirname(self::moduleRoot()) . '/*', GLOB_ONLYDIR) ?: [] as $siblingDir) {
 			$otherMod = basename($siblingDir);

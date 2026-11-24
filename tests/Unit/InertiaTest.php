@@ -1474,24 +1474,31 @@ it('hardens SSR hydration script injection, header name sanitization, nested Err
 	// 4. TypeGenerator rejects path traversal and non-.ts output paths
 	$templatesPath = rtrim((string) wire()->config->paths->templates, '/\\');
 	$defaultTsPath = $templatesPath . '/assets/js/types/inertia.d.ts';
+	$origDefaultTs = is_file($defaultTsPath) ? file_get_contents($defaultTsPath) : false;
 
-	$traversalGen = $inertia->typeGenerator()->generate(
-		templateNames: ['home'],
-		force: false,
-		generatePhp: false,
-		generateTs: true,
-		tsOutputPath: '../../evil.php'
-	);
-	expect($traversalGen['typescript']['path'] ?? null)->toBe($defaultTsPath);
+	try {
+		$traversalGen = $inertia->typeGenerator()->generate(
+			templateNames: ['home'],
+			force: false,
+			generatePhp: false,
+			generateTs: true,
+			tsOutputPath: '../../evil.php'
+		);
+		expect($traversalGen['typescript']['path'] ?? null)->toBe($defaultTsPath);
 
-	$phpExtGen = $inertia->typeGenerator()->generate(
-		templateNames: ['home'],
-		force: false,
-		generatePhp: false,
-		generateTs: true,
-		tsOutputPath: 'assets/js/types/evil.php'
-	);
-	expect($phpExtGen['typescript']['path'] ?? null)->toBe($defaultTsPath);
+		$phpExtGen = $inertia->typeGenerator()->generate(
+			templateNames: ['home'],
+			force: false,
+			generatePhp: false,
+			generateTs: true,
+			tsOutputPath: 'assets/js/types/evil.php'
+		);
+		expect($phpExtGen['typescript']['path'] ?? null)->toBe($defaultTsPath);
+	} finally {
+		if (is_string($origDefaultTs)) {
+			file_put_contents($defaultTsPath, $origDefaultTs);
+		}
+	}
 
 	// 5. Standalone trashed/unpublished Page prop filtering & ProviderRegistry identifier safety
 	$trashedPage = new Page();
@@ -1885,6 +1892,17 @@ it('sanitizes dangerous navigation URI schemes, enforces Page::viewable(false) R
 	$inputfield->processInput($inputData);
 	expect($inputfield->attr('value'))->toBe(['safe' => 'updated']);
 
+	$rawArrayPost = [
+		'widget_state' => [
+			'safe' => 'array_updated',
+			'__proto__' => ['polluted' => true],
+			'_SERVER' => 'leak',
+		],
+	];
+	$arrayPost = new \ProcessWire\WireInputData($rawArrayPost);
+	$inputfield->processInput($arrayPost);
+	expect($inputfield->attr('value'))->toBe(['safe' => 'array_updated']);
+
 	$config = $wire->config;
 	$prevDemo = $config->demo ?? false;
 	try {
@@ -1894,7 +1912,7 @@ it('sanitizes dangerous navigation URI schemes, enforces Page::viewable(false) R
 		];
 		$demoInputData = new \ProcessWire\WireInputData($rawDemoPost);
 		$inputfield->processInput($demoInputData);
-		expect($inputfield->attr('value'))->toBe(['safe' => 'updated']);
+		expect($inputfield->attr('value'))->toBe(['safe' => 'array_updated']);
 
 		// 4. InertiaTypesCommand and InertiaInstallCommand reject writes in demo mode
 		$typesTester = new CommandTester(new InertiaTypesCommand());
