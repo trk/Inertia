@@ -65,6 +65,10 @@ abstract class InputfieldInertia extends Inputfield implements InertiaSerializab
 
 	protected function sanitizeInertiaInput(mixed $raw): mixed
 	{
+		if (is_array($raw)) {
+			return Request::sanitizeInputTree($raw);
+		}
+
 		if (is_string($raw) && $this->decodeJsonInput()) {
 			$trimmed = trim($raw);
 			if (
