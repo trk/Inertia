@@ -6,7 +6,7 @@ risk: safe
 source: processwire-boost
 date_added: "2026-11-07"
 metadata:
-  version: 13
+  version: 15
   inertia-version: 3
   processwire-version: ">=3.0.271"
   php-version: ">=8.4"
